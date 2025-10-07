@@ -1,0 +1,8 @@
+# .gitignore
+data/
+rag_index/
+.venv/
+__pycache__/
+*.pyc
+*.npy
+*.faiss
