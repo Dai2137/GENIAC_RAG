@@ -1,0 +1,17 @@
+# Core scientific libraries
+numpy>=1.24.0
+pandas>=2.0.0
+tqdm>=4.66.0
+ujson>=5.8.0
+
+# Vector search
+faiss-cpu>=1.8.0
+
+# Embedding model (日本語・英語対応)
+sentence-transformers>=3.0.1
+
+# Text retrieval baseline
+rank-bm25>=0.2.2
+
+# (Optional) JSON utilities / CLI
+argparse>=1.4.0
