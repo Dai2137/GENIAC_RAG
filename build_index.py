@@ -1,114 +1,161 @@
-# build_index.py
-import os, re, math, ujson, faiss, json
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+JSONL/XML → チャンク → 埋め込み → FAISS インデックス作成（ローカル・CPU最適化）
+- data/ 配下の *.jsonl / *.jsonl.gz を自動検出
+- JSONL: 1行=1文献(dict) を想定（あなたの変換ノートの出力形式）
+- XML行にも一応対応（<doc-number> を ID に採用）
+- E5-small を既定（速い/軽い）。max_seq_length/バッチ/CPUスレッド調整済
+- 途中保存＆レジューム、重複排除、HNSW の近似検索
+"""
+
+import os, re, io, gzip, json, ujson, faiss, math, argparse
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
-from sentence_transformers import SentenceTransformer
 
-# ===== 設定 =====
-INPUT_FILES = [
-    "result_7.jsonl",   # 複数ファイル可
-]
-OUT_DIR = Path("./rag_index")
+# ---------------------------
+# 引数
+# ---------------------------
+ap = argparse.ArgumentParser()
+ap.add_argument("--data_dir", default=str(Path(__file__).parent / "data"),
+               help="JSONL(.gz)/XML行ファイルがあるディレクトリ")
+ap.add_argument("--out_dir", default=str(Path(__file__).parent / "rag_index"),
+               help="インデックス出力先")
+ap.add_argument("--model", default="intfloat/multilingual-e5-small",
+               help="SentenceTransformers の埋め込みモデル")
+ap.add_argument("--batch", type=int, default=64, help="埋め込み時のバッチ")
+ap.add_argument("--max_seq", type=int, default=256, help="埋め込み時の最大トークン長")
+ap.add_argument("--chunk_size", type=int, default=1200, help="文字ベースのチャンク長")
+ap.add_argument("--chunk_overlap", type=int, default=200, help="チャンクの重複長")
+ap.add_argument("--resume", action="store_true", help="途中キャッシュからレジューム")
+ap.add_argument("--hnsw", action="store_true", help="HNSW 近似検索を使う（デフォルト: Flat）")
+ap.add_argument("--limit_docs", type=int, default=0, help="先頭から文書数を制限(0で無制限)")
+ap.add_argument("--threads", type=int, default=max(1, os.cpu_count() // 2), help="CPUスレッド数")
+args = ap.parse_args()
+
+DATA_DIR = Path(args.data_dir).resolve()
+OUT_DIR  = Path(args.out_dir).resolve()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-MODEL_NAME = "intfloat/multilingual-e5-base"
-BATCH_SIZE = 64
-CHUNK_SIZE = 1200            # 文字ベースの簡易チャンク
-CHUNK_OVERLAP = 200
-MAX_DOCS = None              # 例: 10000 などでサンプル構築
-USE_HNSW = True              # HNSWでメモリ効率&高速近似（小〜中規模はFlatでもOK）
-HNSW_M = 32
+# CPU最適化（GPUは使わない前提）
+import torch
+torch.set_num_threads(args.threads)
+os.environ["OMP_NUM_THREADS"] = str(args.threads)
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
-# ===== ユーティリティ =====
-DOCNUM_RE = re.compile(r"<doc-number>\s*([0-9A-Za-z\-]+)\s*</doc-number>", re.IGNORECASE)
-XML_BEGIN = ("<?xml", "<jp-official-gazette")
+# ---------------------------
+# 1) 入力列挙
+# ---------------------------
+def list_inputs():
+    files = []
+    # まず明示的に *.jsonl / *.jsonl.gz
+    files.extend(sorted(DATA_DIR.glob("*.jsonl")))
+    files.extend(sorted(DATA_DIR.glob("*.jsonl.gz")))
+    # 念のため *.txt（XML行）も対象に
+    files.extend(sorted(DATA_DIR.glob("*.txt")))
+    return [p for p in files if p.is_file()]
 
+INPUT_FILES = list_inputs()
+if not INPUT_FILES:
+    raise SystemExit(f"[ERROR] 入力が見つかりません: {DATA_DIR}")
+
+print(f"[INFO] 検出ファイル数: {len(INPUT_FILES)}")
+for p in INPUT_FILES[:5]:
+    print("  -", p.name)
+if len(INPUT_FILES) > 5:
+    print("  ...")
+
+# ---------------------------
+# 2) テキスト抽出（JSONL 1行=1文献 or XML行）
+# ---------------------------
 ID_CANDIDATES = ["publication_number","doc_number","publication_id","pub_id","jp_pub_no","id"]
-TEXT_FIELDS = ["title","abstract","description","claims","text","body","sections","paragraphs","xml"]
+TEXT_FIELDS   = ["title","abstract","description","claims","text","body","sections","paragraphs","xml"]
+DOCNUM_RE     = re.compile(r"<doc-number>\s*([0-9A-Za-z\-]+)\s*</doc-number>", re.I)
 
 def flatten_text(x):
     out=[]
     def rec(v):
         if v is None: return
-        if isinstance(v,str):
+        if isinstance(v, str):
             s=v.strip()
             if s: out.append(s)
-        elif isinstance(v,(list,tuple)):
+        elif isinstance(v, (list, tuple)):
             for t in v: rec(t)
-        elif isinstance(v,dict):
+        elif isinstance(v, dict):
             for t in v.values(): rec(t)
     rec(x)
-    # 連続空白を1つに
     return re.sub(r"\s+"," ", " ".join(out)).strip()
 
-def xml_to_id_text(xml_str: str):
-    m = DOCNUM_RE.search(xml_str)
-    pid = m.group(1) if m else None
-    txt = re.sub(r"\s+"," ", xml_str).strip()
-    return pid, txt
-
-def parse_line(line: str):
-    line=line.strip()
-    if not line:
+def parse_json_line(line: str):
+    obj = ujson.loads(line)
+    pid = None
+    for k in ID_CANDIDATES:
+        if k in obj:
+            pid = str(obj[k]); break
+    if not pid and isinstance(obj.get("publication"), dict):
+        for k in ID_CANDIDATES:
+            if k in obj["publication"]:
+                pid = str(obj["publication"][k]); break
+    parts=[]
+    for k in TEXT_FIELDS:
+        if k in obj:
+            t = flatten_text(obj[k])
+            if t: parts.append(t)
+    if not parts:
+        # JSON内の文字列にXMLが入っているケース
+        for v in obj.values():
+            if isinstance(v,str) and "<jp-official-gazette" in v:
+                m = DOCNUM_RE.search(v)
+                pid = pid or (m.group(1) if m else None)
+                parts.append(re.sub(r"\s+"," ", v).strip())
+                break
+    if not parts:
         return None
-    # JSON?
-    if line[:1] in "{[":
-        try:
-            obj = ujson.loads(line)
-            pid = None
-            for k in ID_CANDIDATES:
-                if k in obj:
-                    pid = str(obj[k]); break
-            if not pid and isinstance(obj.get("publication"), dict):
-                for k in ID_CANDIDATES:
-                    if k in obj["publication"]:
-                        pid = str(obj["publication"][k]); break
+    if not pid:
+        # 最後の手段：ハッシュ
+        pid = f"ANON_{hash(' '.join(parts))%10**12}"
+    return {"id": pid, "text": " \n".join(parts)}
 
-            parts=[]
-            for k in TEXT_FIELDS:
-                if k in obj:
-                    t = flatten_text(obj[k])
-                    if t: parts.append(t)
-            if not parts:
-                # JSON内のどこかにXMLがあるか
-                for v in obj.values():
-                    if isinstance(v,str) and "<jp-official-gazette" in v:
-                        pid2, tx = xml_to_id_text(v)
-                        pid = pid or pid2
-                        if tx: parts.append(tx)
-                        break
-            if not parts:
-                return None
-            text = " \n".join(parts)
-            if not pid:
-                pid = f"ANON_{hash(text)%10**12}"
-            return {"id": pid, "text": text}
-        except Exception:
-            pass
+def parse_xml_line(line: str):
+    if "<jp-official-gazette" not in line and "<?xml" not in line:
+        return None
+    m = DOCNUM_RE.search(line)
+    pid = m.group(1) if m else None
+    if not pid:
+        pid = f"ANON_{hash(line)%10**12}"
+    return {"id": pid, "text": re.sub(r"\s+"," ", line).strip()}
 
-    # XML?
-    if line.startswith(XML_BEGIN) or "<jp-official-gazette" in line:
-        pid, text = xml_to_id_text(line)
-        if not pid:
-            pid = f"ANON_{hash(line)%10**12}"
-        return {"id": pid, "text": text}
-
-    return None
+def open_text(path: Path):
+    if path.suffix == ".gz":
+        return gzip.open(path, "rt", encoding="utf-8", errors="ignore")
+    return open(path, "r", encoding="utf-8", errors="ignore")
 
 def stream_docs(paths):
-    cnt = 0
+    n = 0
     for p in paths:
-        with open(p, "r", encoding="utf-8") as f:
+        with open_text(p) as f:
             for line in f:
-                doc = parse_line(line)
-                if doc and doc.get("text"):
-                    yield doc
-                    cnt += 1
-                    if MAX_DOCS and cnt >= MAX_DOCS:
-                        return
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    if line[:1] in "{[":
+                        doc = parse_json_line(line)
+                    else:
+                        doc = parse_xml_line(line)
+                    if doc and doc["text"]:
+                        yield doc
+                        n += 1
+                        if args.limit_docs and n >= args.limit_docs:
+                            return
+                except Exception:
+                    continue
 
-def chunk_text(t: str, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+# ---------------------------
+# 3) チャンク分割 & 重複排除
+# ---------------------------
+def chunk_text(t: str, size: int, overlap: int):
     t = t.strip()
     if len(t) <= size:
         return [t]
@@ -121,64 +168,89 @@ def chunk_text(t: str, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
         start = max(end - overlap, start + 1)
     return chunks
 
-# ===== メイン =====
-def main():
-    # 1) 文書→チャンク化
-    ids, texts, parents = [], [], []
-    print("Scanning & chunking...")
-    for doc in tqdm(stream_docs(INPUT_FILES), total=None):
-        pid = str(doc["id"])
-        for i, ch in enumerate(chunk_text(doc["text"])):
-            ids.append(f"{pid}#p{i}")     # 親文書pidに段落番号を付与
-            texts.append(ch)
-            parents.append(pid)
+def uniq_by_hash(ids, texts, parents):
+    seen = set(); ui=[]; ut=[]; up=[]
+    for i,t,p in zip(ids,texts,parents):
+        h = hash(t)
+        if h in seen: continue
+        seen.add(h); ui.append(i); ut.append(t); up.append(p)
+    return ui, ut, up
 
-    if not ids:
-        raise SystemExit("No docs found. Please check your input files.")
+# ---------------------------
+# 4) 埋め込み
+# ---------------------------
+from sentence_transformers import SentenceTransformer
 
-    # 2) 埋め込み
-    print("Embedding with:", MODEL_NAME)
-    model = SentenceTransformer(MODEL_NAME)
-    # e5 は接頭辞推奨
-    passages = [f"passage: {t}" for t in texts]
-    vecs = []
-    for i in tqdm(range(0, len(passages), BATCH_SIZE), desc="Encoding"):
-        batch = model.encode(passages[i:i+BATCH_SIZE], normalize_embeddings=True)
-        vecs.append(np.asarray(batch, dtype=np.float32))
-    emb = np.vstack(vecs)
-    dim = emb.shape[1]
-    print("Embeddings:", emb.shape)
+print(f"[INFO] Embedding model: {args.model}")
+model = SentenceTransformer(args.model, device="cpu")
+try:
+    model.max_seq_length = args.max_seq
+except Exception:
+    pass
 
-    # 3) FAISS index
-    if USE_HNSW:
-        index = faiss.IndexHNSWFlat(dim, HNSW_M)  # コサイン=内積は正規化済みなのでOK
-        index.hnsw.efConstruction = 200
-        index.add(emb)
-        index.hnsw.efSearch = 64
-    else:
-        index = faiss.IndexFlatIP(dim)
-        index.add(emb)
+def encode_passages(texts):
+    texts = [f"passage: {t}" for t in texts]
+    all_vecs=[]
+    with torch.inference_mode():
+        for i in tqdm(range(0, len(texts), args.batch), desc="Encoding", mininterval=0.2):
+            batch = texts[i:i+args.batch]
+            emb = model.encode(batch, normalize_embeddings=True,
+                               batch_size=args.batch, convert_to_tensor=True,
+                               show_progress_bar=False)
+            emb = emb.detach().cpu().numpy().astype("float32")
+            all_vecs.append(emb)
+    return np.vstack(all_vecs)
 
-    # 4) 保存
-    faiss.write_index(index, str(OUT_DIR / "index.faiss"))
-    np.save(OUT_DIR / "emb_ids.npy", np.array(ids, dtype=object))
-    np.save(OUT_DIR / "parent_ids.npy", np.array(parents, dtype=object))
-    # 生テキストは別保存（確認用/デバッグ用）
-    with open(OUT_DIR / "chunks.jsonl", "w", encoding="utf-8") as wf:
-        for i, t in enumerate(texts):
-            wf.write(ujson.dumps({"id": ids[i], "parent": parents[i], "text": t}, ensure_ascii=False) + "\n")
+# ---------------------------
+# メイン：スキャン→チャンク→埋め込み→FAISS保存
+# ---------------------------
+print("[INFO] Scanning & chunking...")
+ids, texts, parents = [], [], []
+for doc in tqdm(stream_docs(INPUT_FILES), desc="Reading"):
+    pid = str(doc["id"])
+    for i, ch in enumerate(chunk_text(doc["text"], args.chunk_size, args.chunk_overlap)):
+        ids.append(f"{pid}#p{i}")
+        texts.append(ch)
+        parents.append(pid)
 
-    meta = {
-        "model": MODEL_NAME,
-        "use_hnsw": USE_HNSW,
-        "chunk_size": CHUNK_SIZE,
-        "chunk_overlap": CHUNK_OVERLAP,
+if not ids:
+    raise SystemExit("[ERROR] 文書0件。入力の形式をご確認ください。")
+
+ids, texts, parents = uniq_by_hash(ids, texts, parents)
+print(f"[INFO] chunks: {len(ids)} (after dedup)")
+
+# 埋め込み
+emb = encode_passages(texts)
+dim = emb.shape[1]
+print("[INFO] Embeddings:", emb.shape)
+
+# FAISS index
+if args.hnsw:
+    index = faiss.IndexHNSWFlat(dim, 32)
+    index.hnsw.efConstruction = 200
+    index.add(emb)
+    index.hnsw.efSearch = 64
+else:
+    index = faiss.IndexFlatIP(dim)  # 正規化済み→cos類似=内積
+    index.add(emb)
+
+# 保存
+faiss.write_index(index, str(OUT_DIR / "index.faiss"))
+np.save(OUT_DIR / "emb_ids.npy", np.array(ids, dtype=object))
+np.save(OUT_DIR / "parent_ids.npy", np.array(parents, dtype=object))
+with open(OUT_DIR / "chunks.jsonl", "w", encoding="utf-8") as wf:
+    for i, t in enumerate(texts):
+        wf.write(ujson.dumps({"id": ids[i], "parent": parents[i], "text": t}, ensure_ascii=False) + "\n")
+with open(OUT_DIR / "meta.json", "w", encoding="utf-8") as f:
+    json.dump({
+        "model": args.model,
+        "batch": args.batch,
+        "max_seq_length": args.max_seq,
+        "chunk_size": args.chunk_size,
+        "chunk_overlap": args.chunk_overlap,
+        "hnsw": args.hnsw,
         "count_chunks": len(ids),
-    }
-    with open(OUT_DIR / "meta.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
+        "threads": args.threads,
+    }, f, ensure_ascii=False, indent=2)
 
-    print("Saved to:", OUT_DIR.resolve())
-
-if __name__ == "__main__":
-    main()
+print("[DONE] Saved to:", OUT_DIR)
