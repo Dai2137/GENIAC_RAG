@@ -142,5 +142,3 @@ drive.mount('/content/drive')
 | Colab セットアップ | 依存を統一              | 上記 Colab セルを実行                                    |
 | 動作確認         | ライブラリのバージョン確認      | NumPy / FAISS / CUDA                              |
 | 実行           | インデックス構築 → 検索 → 評価 | `build_index.py`, `search.py`, `score_explore.py` |
-
-```
