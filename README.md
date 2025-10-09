@@ -1,141 +1,334 @@
-# 🚀 インストール手順メモ
+# GENIAC-PRIZE Patent Retrieval (RAG Pipeline)
+
+特許文献データを用いて、
+**埋め込み（国内/汎用API） → ベクトル索引（FAISS） → 検索 → 評価**
+を行う最小構成のプロジェクトです。GPU不要・再現性重視。
+
+* 埋め込みは **国内ベンダの OpenAI 互換API**（ELYZA / rinna / ABEJA 等）または **Gemini** を利用
+* ベクトル検索は **FAISS（CPU）**
+* GENIAC（官公庁コンペ）を念頭に、**事前計算→当日安定稼働**の設計
 
 ---
 
-## 🧩 1. 仮想環境の作成（任意）
+## 0. 前提（これだけあればOK）
 
-```bash
-python -m venv .venv
-````
+* **Python 3.10+**（3.11 推奨）
+* OS: macOS / Linux / Windows（PowerShell）
+* 取得済みの特許データ（`*.jsonl` or `*.jsonl.gz` or 行ごとXML文字列）
 
-### 有効化
+  * 例: `data/result_1/` 配下に `result_1.jsonl` など
+* いずれかの **Embedding API キー**
 
-#### Windows
+  * 国内API（OpenAI互換エンドポイント） → 例: `EMB_API_KEY`
+  * Google Gemini → `GOOGLE_API_KEY`
 
-```bash
-.venv\Scripts\activate
+---
+
+## 1. ディレクトリ構成
+
+```text
+your-project/
+├─ build_index.py        # 埋め込み作成 & FAISS索引の作成（API利用）
+├─ search.py             # クエリ埋め込み→FAISS検索（API利用）
+├─ score_explore.py      # GENIAC仕様に沿ったスコア計算（AX/AY）
+├─ requirements.txt
+├─ data/
+│   └─ result_1/         # 入力データ置き場（jsonl/jsonl.gz/行XML）
+│       ├─ result_1.jsonl
+│       └─ ...
+└─ rag_index/            # 出力（自動生成）
 ```
 
-#### macOS / Linux
+---
+
+## 2. 環境構築（仮想環境＋依存の導入）
+
+### macOS / Linux（Bash）
 
 ```bash
+python3 -m venv .venv
 source .venv/bin/activate
-```
 
----
-
-## 📦 2. 依存パッケージのインストール
-
-```bash
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
----
+### Windows（PowerShell）
 
-## 💻 3. Google Colab でのセットアップ
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 
-> Colab（T4 / CUDA12.x）で動かす場合はこちらをセルごとにコピーして実行。
-
-### 🧹 (1) 競合しやすい既存パッケージの削除
-
-```bash
-!pip -q uninstall -y \
-  faiss-gpu-cu12 faiss-gpu faiss-cpu \
-  opencv-python opencv-contrib-python opencv-python-headless \
-  spacy thinc tensorflow fastai dopamine-rl \
-  pandas
+python -m pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-### 🧱 (2) NumPy / pandas / FAISS / OpenCV / 主要ツールのセットアップ
+**requirements.txt（最小）**
 
-```bash
-# NumPy（FAISS互換バージョン）
-!pip -q install --no-cache-dir "numpy==1.26.4"
-
-# pandas（Colab互換）
-!pip -q install --no-cache-dir "pandas==2.2.2"
-
-# FAISS (GPU, CUDA 12.x)
-!pip -q install --no-cache-dir "faiss-gpu-cu12==1.12.0"
-
-# OpenCV（必要な場合のみ。GUI不要なら headless が安定）
-!pip -q install --no-cache-dir "opencv-python-headless==4.9.0.80"
-
-# その他ツール
-!pip -q install --no-cache-dir ujson tqdm rank_bm25 sentence-transformers
+```txt
+faiss-cpu
+numpy
+pandas
+ujson
+tqdm
+requests
+google-generativeai    # Geminiを使う場合に必要
 ```
 
-> ⚠️ **実行後に必ず「ランタイムを再起動」してください。**
-> 手動操作：メニュー → 「ランタイム」→「ランタイムを再起動」
+> GPUは不要です。もし自前GPUで使いたい人は `faiss-gpu` に置き換え可。
 
 ---
 
-### ✅ (3) 動作確認セル
+## 3. APIキーの設定
 
-```python
-import numpy as np, pandas as pd, torch, faiss
+### 国内API（OpenAI互換）を使う場合
 
-print("NumPy:", np.__version__)             # -> 1.26.4
-print("pandas:", pd.__version__)            # -> 2.2.2
-print("CUDA (torch):", torch.version.cuda)  # -> 12.6 ならOK
-print("FAISS:", faiss.__version__, "GPUs:", faiss.get_num_gpus())
+```bash
+# macOS / Linux
+export EMB_API_KEY="あなたのAPIキー"
+# Windows PowerShell
+# $env:EMB_API_KEY="あなたのAPIキー"
+```
 
-# OpenCV を入れた場合のみ
-try:
-    import cv2
-    print("OpenCV:", cv2.__version__)       # -> 4.9.0.80
-except Exception as e:
-    print("OpenCV not installed (OK):", e)
+> **エンドポイント（api_base）例**: `https://api.example.com/v1`
+> **モデル名（emb_model）例**: `embedding-japanese-v1`
+> ベンダの仕様書の値をそのまま指定してください。
+
+### Geminiを使う場合
+
+```bash
+# macOS / Linux
+export GOOGLE_API_KEY="あなたのAPIキー"
+# Windows PowerShell
+# $env:GOOGLE_API_KEY="あなたのAPIキー"
 ```
 
 ---
 
-## 📂 4. Google Drive を使う場合
+## 4. データを置く（入力形式）
 
-```python
-from google.colab import drive
-drive.mount('/content/drive')
+* JSONL（1行＝1レコード）を推奨。XML文字列1行でも可。
+* 下記のいずれかのキーがあればIDとして優先取得：
+  `publication_number, doc_number, publication_id, pub_id, jp_pub_no, id`
+* テキストは下記フィールドを結合：
+  `title, abstract, description, claims, text, body, sections, paragraphs, xml`
+
+> 例：`data/result_1/result_1.jsonl` を用意。
+
+---
+
+## 5. 埋め込み作成 & インデックス構築（build_index.py）
+
+### 国内API（OpenAI互換）
+
+```bash
+python build_index.py \
+  --data_dir ./data/result_1 \
+  --out_dir  ./rag_index \
+  --provider openai_compat \
+  --api_base https://api.example.com/v1 \
+  --emb_model embedding-japanese-v1 \
+  --api_key_env EMB_API_KEY \
+  --batch 128 --rpm 180 \
+  --chunk_size 1200 --chunk_overlap 200
+```
+
+### Gemini
+
+```bash
+python build_index.py \
+  --data_dir ./data/result_1 \
+  --out_dir  ./rag_index \
+  --provider gemini \
+  --emb_model models/embedding-001 \
+  --api_key_env GOOGLE_API_KEY \
+  --batch 32 --rpm 300 \
+  --chunk_size 1200 --chunk_overlap 200
+```
+
+**出力（自動生成）**
+
+```
+rag_index/
+ ├─ index.faiss        # ベクトル索引
+ ├─ emb_ids.npy        # チャンクID
+ ├─ parent_ids.npy     # 親文献ID（公開番号など）
+ ├─ chunks.jsonl       # チャンクの中身（デバッグ用）
+ └─ meta.json          # 実行時メタ（再検索に再利用）
+```
+
+> 既定は **FAISS IndexFlatIP（厳密検索）× 正規化ベクトル**。
+> 大規模化時は量子化/圧縮は別途（本READMEでは安全優先）。
+
+---
+
+## 6. 検索（search.py）
+
+* まずは**親文献単位の集約**を有効化するのが実用的（`--group_by_parent`）
+* 使う埋め込みAPIは**インデックス作成時の設定に合わせる**
+
+### 国内API（OpenAI互換）
+
+```bash
+python search.py \
+  --index_dir ./rag_index \
+  --provider openai_compat \
+  --api_base https://api.example.com/v1 \
+  --emb_model embedding-japanese-v1 \
+  --api_key_env EMB_API_KEY \
+  --q "カーボンナノチューブの製造方法" \
+  --k 20 \
+  --group_by_parent > search_result.json
+```
+
+### Gemini
+
+```bash
+python search.py \
+  --index_dir ./rag_index \
+  --provider gemini \
+  --emb_model models/embedding-001 \
+  --api_key_env GOOGLE_API_KEY \
+  --q "有機ELディスプレイの封止構造" \
+  --k 20 \
+  --group_by_parent > search_result.json
+```
+
+**出力例（`search_result.json`）**
+
+```json
+{
+  "query": "カーボンナノチューブの製造方法",
+  "provider": "openai_compat",
+  "model": "embedding-japanese-v1",
+  "results": [
+    {"rank": 1, "id": "JP2020123456A#p0", "parent_id": "JP2020123456A", "score": 0.882},
+    {"rank": 2, "id": "JP2019009876A#p2", "parent_id": "JP2019009876A", "score": 0.851}
+  ]
+}
 ```
 
 ---
 
-## 🔍 5. 使い方（Colab セルでの実行例）
+## 7. 評価（score_explore.py：GENIACのAX/AY仕様）
 
-### 📘 (1) インデックス構築
+* 真値 `ax_ay_truth.csv` の形式（UTF-8, ヘッダー必須）：
+  `alpha,type,ref`
+
+  * `alpha`: 対象出願（例：`JP2020123456A`）
+  * `type`: `AX` or `AY`
+  * `ref` : 関連文献の公開番号
 
 ```bash
-!python build_index.py \
-  --data_dir "/content/drive/MyDrive/Colab Notebooks/GENIAC" \
-  --out_dir "/content/rag_index" \
-  --model intfloat/multilingual-e5-small \
-  --batch 256 --max_seq 256 --use_gpu_faiss
+python score_explore.py \
+  --truth ./ax_ay_truth.csv \
+  --alpha JP2020123456A \
+  --retrieved_json ./search_result.json \
+  --k 50 \
+  --mMax 10 \
+  --P 0.8
 ```
 
-### 🔎 (2) 検索実行
+**出力例**
 
-```bash
-!python search.py \
-  --index_dir "/content/rag_index" \
-  --q "リチウムイオン二次電池 電解液添加剤" \
-  --k 10 --group_by_parent
-```
-
-### 📊 (3) 検索結果のスコア評価
-
-```bash
-!python score_explore.py \
-  --truth "/content/drive/MyDrive/Colab Notebooks/GENIAC/ax_ay_truth.csv" \
-  --alpha JP20XXXXXXXA \
-  --retrieved_json "/content/retrieved.json"
+```json
+{
+  "alpha": "JP2020123456A",
+  "Nax": 1, "Nay": 4, "n": 5,
+  "m": 20, "mMin": 7, "mMax": 10, "P": 0.8,
+  "score_scaled": 93.3,
+  "ax_hit": true,
+  "ay_hit": 2,
+  "precision_at_k": 0.25,
+  "recall_ay": 0.5
+}
 ```
 
 ---
 
-## 🧾 まとめ
+## 8. よくある質問（FAQ）
 
-| 区分           | 目的                 | 主なコマンド                                            |
-| ------------ | ------------------ | ------------------------------------------------- |
-| 仮想環境構築       | ローカル環境を分離          | `python -m venv .venv`                            |
-| Colab セットアップ | 依存を統一              | 上記 Colab セルを実行                                    |
-| 動作確認         | ライブラリのバージョン確認      | NumPy / FAISS / CUDA                              |
-| 実行           | インデックス構築 → 検索 → 評価 | `build_index.py`, `search.py`, `score_explore.py` |
+**Q1. `faiss-cpu` は必須？**
+A. 必須です（インデックス作成・検索に使用）。
+
+**Q2. 429/5xx が出る／途中で落ちる**
+A. `build_index.py` は指数バックオフ＋レート制御済みです。`--rpm` と `--batch` を下げて再実行。途中成果は `rag_index/` に逐次保存されます。
+
+**Q3. モデル次元は自動で合わせてる？**
+A. はい。APIの埋め込み次元に合わせてFAISSを作成し、クエリ側も正規化してから検索します。
+
+**Q4. クエリの書き方のコツは？**
+A. 技術課題・発明主題で表現するのが最も効果的（例：「ドローンの姿勢制御装置」「ポリ乳酸系樹脂の改質方法」）。
+
+**Q5. データが巨大で時間がかかる**
+A. `--limit_docs` でサンプルから始め、結線が正しいことを確認してから全量に拡張してください。
+
+---
+
+## 9. 代表的コマンド（コピペ用）
+
+**国内API一気通貫**
+
+```bash
+# 1) 環境
+python3 -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip && pip install -r requirements.txt
+export EMB_API_KEY="YOUR_KEY"
+
+# 2) 埋め込み→索引
+python build_index.py \
+  --data_dir ./data/result_1 \
+  --out_dir  ./rag_index \
+  --provider openai_compat \
+  --api_base https://api.example.com/v1 \
+  --emb_model embedding-japanese-v1 \
+  --api_key_env EMB_API_KEY
+
+# 3) 検索
+python search.py \
+  --index_dir ./rag_index \
+  --provider openai_compat \
+  --api_base https://api.example.com/v1 \
+  --emb_model embedding-japanese-v1 \
+  --api_key_env EMB_API_KEY \
+  --q "ドローンの姿勢制御装置" \
+  --k 20 --group_by_parent > search_result.json
+
+# 4) 評価（任意）
+python score_explore.py \
+  --truth ./ax_ay_truth.csv \
+  --alpha JP2020123456A \
+  --retrieved_json ./search_result.json
+```
+
+**Gemini一気通貫**
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip && pip install -r requirements.txt
+export GOOGLE_API_KEY="YOUR_KEY"
+
+python build_index.py \
+  --data_dir ./data/result_1 \
+  --out_dir  ./rag_index \
+  --provider gemini \
+  --emb_model models/embedding-001 \
+  --api_key_env GOOGLE_API_KEY
+
+python search.py \
+  --index_dir ./rag_index \
+  --provider gemini \
+  --emb_model models/embedding-001 \
+  --api_key_env GOOGLE_API_KEY \
+  --q "有機ELディスプレイの封止構造" \
+  --k 20 --group_by_parent > search_result.json
+```
+
+---
+
+## 10. 変更履歴（このREADME対応）
+
+* SentenceTransformer依存を排除し、**APIベース埋め込み**に統一
+* `build_index.py` / `search.py` / `score_explore.py` を**国内API・Gemini両対応**
+* **親文献集約・重複排除・上位K**の安定ロジック実装
+* **GENIACのAX/AY評価**をそのまま流せるCLI
