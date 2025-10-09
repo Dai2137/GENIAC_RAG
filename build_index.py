@@ -27,7 +27,7 @@ ap.add_argument("--max_seq",  type=int, default=256, help="(互換のため残�
 ap.add_argument("--chunk_size", type=int, default=1200)
 ap.add_argument("--chunk_overlap", type=int, default=200)
 ap.add_argument("--use_gpu_faiss", action="store_true", help="FAISSをGPUに載せる(IndexFlatIPのみ)")
-ap.add_argument("--limit_docs", type=int, default=0)
+ap.add_argument("--limit_docs", type=int, default=10)
 args = ap.parse_args()
 
 DATA_DIR = Path(args.data_dir)

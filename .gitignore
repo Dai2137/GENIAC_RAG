@@ -7,3 +7,4 @@ __pycache__/
 *.faiss
 *.dll
 *.lib
+plamo_demo.py

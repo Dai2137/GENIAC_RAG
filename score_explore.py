@@ -1,176 +1,168 @@
-# score_explore.py
-# 評価スクリプト（API検索結果の形式差を吸収し、チャンク→親文献へ集約）
-# 使い方例:
-#   python score_explore.py --truth ax_ay_truth.csv --alpha JP2020-123456A \
-#       --retrieved_json search_result.json --k 50 --mMax 10 --P 0.8
-#
-# 入力JSONの許容フォーマット:
-#   1) {"results":[{"id":"JP...#p0","parent":"JP...","score":0.82}, ...]}
-#   2) [{"parent_id":"JP...","similarity":0.91}, ...]
-#   3) {"hits":[...]}  などでも、キーを自動検出
-#
-# 親文献IDの抽出ロジック:
-#   - "parent_id" or "parent" があればそれを使う
-#   - なければ "id" を "JP...#p3" 形式とみなし、"#" 以前を親IDとみなす
-#   - それでも取れない場合は id 全体を親IDとして扱う
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+GENIAC-PRIZE 評価スクリプト（堅牢＋ファイル出力版）
+- 配布CSV（syutugan, category, himotuki, koukaibi）準拠
+- search_result.json の "query" は無視
+- 文字コード自動判定（UTF-8 / UTF-8-SIG / CP932）
+- 出力: ./score_results/{syutugan}_result.json
+"""
 
-import math, json, argparse
-import pandas as pd
+import json, math, argparse, pandas as pd
+from pathlib import Path
 
-def load_truth(csv_path: str) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
-    if "type" not in df.columns or "alpha" not in df.columns or "ref" not in df.columns:
-        raise ValueError("truth CSV には columns=['alpha','type','ref'] が必要です")
-    df["type"] = df["type"].astype(str).str.strip().str.upper()
-    df["alpha"] = df["alpha"].astype(str).str.strip()
-    df["ref"] = df["ref"].astype(str).str.strip()
-    return df
+# ---------- ファイル読み込みユーティリティ ----------
+def read_text_auto(path: str) -> str:
+    for enc in ("utf-8-sig", "utf-8", "cp932"):
+        try:
+            with open(path, "r", encoding=enc, errors="strict") as f:
+                return f.read()
+        except UnicodeDecodeError:
+            continue
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
 
-def _extract_parent_id(item: dict) -> str | None:
-    # 優先順: parent_id -> parent -> id(の#前) -> id全体
-    for key in ("parent_id", "parent"):
-        if key in item and isinstance(item[key], str) and item[key].strip():
-            return item[key].strip()
-    if "id" in item and isinstance(item["id"], str) and item["id"].strip():
-        sid = item["id"].strip()
-        if "#" in sid:
-            return sid.split("#", 1)[0]
-        return sid
+def read_json_auto(path: str):
+    txt = read_text_auto(path)
+    try:
+        return json.loads(txt)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"[ERROR] JSON構文が不正です: {path}\n{e}") from e
+
+# ---------- truth CSV読み込み（GENIAC公式形式） ----------
+def load_truth(csv_paths):
+    dfs=[]
+    for p in csv_paths:
+        for enc in ("utf-8","utf-8-sig","cp932"):
+            try:
+                df = pd.read_csv(p, encoding=enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        needed = {"syutugan","category","himotuki"}
+        if not needed.issubset(df.columns):
+            raise ValueError(f"[ERROR] {p} に必要列 {needed} がありません。列: {list(df.columns)}")
+        df = df[list(needed)].copy()
+        df["syutugan"] = df["syutugan"].astype(str).str.strip()
+        df["category"] = df["category"].astype(str).str.strip().str.upper()
+        df["himotuki"] = df["himotuki"].astype(str).str.strip()
+        df = df[df["category"].isin(["AX","AY"])]
+        dfs.append(df)
+    return pd.concat(dfs, ignore_index=True).drop_duplicates()
+
+# ---------- 検索結果JSONから親ID抽出 ----------
+def _extract_parent(it: dict):
+    if not isinstance(it, dict): return None
+    for k in ("parent_id","parent"):
+        if k in it and isinstance(it[k], str):
+            return it[k]
+    if "id" in it and isinstance(it["id"], str):
+        sid = it["id"]
+        return sid.split("#",1)[0] if "#" in sid else sid
     return None
 
-def _extract_score(item: dict) -> float:
-    # スコアキーの候補: "score", "similarity", "dist", "distance"（距離は負号をつけて類似度化）
-    if "score" in item and isinstance(item["score"], (int, float)):
-        return float(item["score"])
-    if "similarity" in item and isinstance(item["similarity"], (int, float)):
-        return float(item["similarity"])
-    if "dist" in item and isinstance(item["dist"], (int, float)):
-        return -float(item["dist"])
-    if "distance" in item and isinstance(item["distance"], (int, float)):
-        return -float(item["distance"])
-    return 0.0  # 不明なら0
-
-def _as_list(obj):
-    if isinstance(obj, list):
-        return obj
+def _as_result_list(obj):
     if isinstance(obj, dict):
-        # よくあるキー名を探す
-        for k in ("results", "hits", "data", "items"):
+        for k in ("results","hits","items","data"):
             if k in obj and isinstance(obj[k], list):
                 return obj[k]
-    # それ以外は単一要素扱い（想定外）
-    return [obj]
+    if isinstance(obj, list):
+        return obj
+    raise ValueError("検索結果JSONに 'results' または 直配列 が必要です。")
 
-def load_retrieved_parent_ids(json_path: str, k: int | None = None) -> list[str]:
-    data = json.load(open(json_path, "r", encoding="utf-8"))
-    items = _as_list(data)
-    # チャンク複数→親文献で集約するため、親IDごとに最高スコアを保持
-    best = {}  # parent_id -> best_score
-    order = {} # parent_id -> first_occurrence_rank（安定ソート用）
-    for rank, it in enumerate(items):
-        if not isinstance(it, dict):
-            continue
-        p = _extract_parent_id(it)
-        if not p:
-            continue
-        s = _extract_score(it)
+def load_retrieved_parent_ids(json_path: str, k: int):
+    data = read_json_auto(json_path)
+    items = _as_result_list(data)
+    best, first = {}, {}
+    def _score(it):
+        for key in ("score","similarity"):  # 類似度
+            if key in it:
+                try: return float(it[key])
+                except: pass
+        for key in ("dist","distance"):      # 距離（負号）
+            if key in it:
+                try: return -float(it[key])
+                except: pass
+        return 0.0
+    for r,it in enumerate(items):
+        p = _extract_parent(it)
+        if not p: continue
+        s = _score(it)
         if (p not in best) or (s > best[p]):
             best[p] = s
-            order.setdefault(p, rank)
-    # スコア降順、同点は先出し順
-    merged = sorted(best.items(), key=lambda kv: (-kv[1], order[kv[0]]))
-    parent_ids = [p for p, _ in merged]
-    if k is not None and k > 0:
-        parent_ids = parent_ids[:k]
-    return parent_ids
+            first.setdefault(p, r)
+    ranked = sorted(best.items(), key=lambda kv: (-kv[1], first[kv[0]]))
+    return [p for p,_ in ranked[:k]]
 
-def compute_score(alpha: str,
-                  retrieved_parent_ids: list[str],
-                  truth_df: pd.DataFrame,
-                  mMax: int = 10,
-                  P: float = 0.8) -> dict:
-    # alpha 毎の真値抽出
-    tt = truth_df[truth_df["alpha"] == alpha]
-    Axs = set(tt.loc[tt["type"] == "AX", "ref"].tolist())
-    Ays = set(tt.loc[tt["type"] == "AY", "ref"].tolist())
+# ---------- スコア計算 ----------
+def compute_score(syutugan: str, retrieved: list[str], truth_df: pd.DataFrame,
+                  mMax: int = 10, P: float = 0.8) -> dict:
+    t = truth_df[truth_df["syutugan"] == syutugan]
+    Axs = set(t.loc[t["category"]=="AX","himotuki"])
+    Ays = set(t.loc[t["category"]=="AY","himotuki"])
     Nax, Nay = len(Axs), len(Ays)
     n = Nax + Nay
-
     if n == 0:
-        return {"alpha": alpha, "score_scaled": 0.0, "detail": "no ground truth"}
+        return {"syutugan": syutugan, "score_scaled": 0.0, "note": "no truth"}
 
-    m = len(retrieved_parent_ids)
+    m = len(retrieved)
     mMin = math.ceil(n / P)
-
     score = 0.0
-    # m のペナルティ
-    if m <= mMin:
-        pass
-    elif m <= mMax:
-        score += -1.0 * (m - mMin)
-    else:
-        score += -1.0 * (mMax - mMin)
 
-    # A(x)（1件以上ヒットで加点／未存在なら大幅減点）
+    # mペナルティ
+    if m > mMin:
+        score -= (m - mMin) if m <= mMax else (mMax - mMin)
+    # Ax
+    ax_hit = any(r in Axs for r in retrieved)
     if Nax > 0:
-        included_ax = any(r in Axs for r in retrieved_parent_ids)
-        score += 20.0 if included_ax else -10.0
+        score += 20 if ax_hit else -10
     else:
-        score += -40.0
-        included_ax = False
-
-    # A(y)（網羅性評価：ヒットは+10、未ヒットは-5）
+        score -= 40
+    # Ay
     if Nay > 0:
-        Nay_prime = sum(1 for r in retrieved_parent_ids if r in Ays)
-        score += 10.0 * Nay_prime
-        score += -5.0 * (Nay - Nay_prime)
+        ay_hit = sum(1 for r in retrieved if r in Ays)
+        score += 10*ay_hit -5*(Nay - ay_hit)
     else:
-        score += -30.0
-        Nay_prime = 0
-
-    # 倍率（仕様踏襲）
-    if n <= 3:
-        mult = 100.0 / 40.0
-    elif n == 4:
-        mult = 100.0 / 50.0
-    else:
-        mult = 100.0 / 60.0
-
-    score_scaled = max(0.0, score * mult)
-
-    # 参考指標
-    # Precision@K: retrieved_parent_ids に対し、(AX∪AY) の命中率
-    gt_set = Axs | Ays
-    hit = sum(1 for r in retrieved_parent_ids if r in gt_set)
-    precision_at_k = (hit / m) if m > 0 else 0.0
-    # Recall(AY): AY のうちどれだけ当てたか
-    recall_ay = (Nay_prime / Nay) if Nay > 0 else None
-
+        ay_hit = 0
+        score -= 30
+    # 倍率
+    mult = 100.0 / (40.0 if n<=3 else 50.0 if n==4 else 60.0)
     return {
-        "alpha": alpha,
+        "syutugan": syutugan,
         "Nax": Nax, "Nay": Nay, "n": n,
         "m": m, "mMin": mMin, "mMax": mMax, "P": P,
-        "score_scaled": score_scaled,
-        "ax_hit": bool(included_ax),
-        "ay_hit": int(Nay_prime),
-        "precision_at_k": precision_at_k,
-        "recall_ay": recall_ay
+        "score_scaled": max(0.0, score*mult),
+        "ax_hit": bool(ax_hit),
+        "ay_hit": ay_hit
     }
 
+# ---------- メイン ----------
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--truth", required=True, help="ax_ay_truth.csv（columns=['alpha','type','ref']）")
-    ap.add_argument("--alpha", required=True, help="評価対象の出願（公開番号）")
-    ap.add_argument("--retrieved_json", required=True, help="検索結果(JSON) API/FAISSどちらでもOK")
-    ap.add_argument("--k", type=int, default=50, help="上位K件までで評価（親文献に集約後）")
-    ap.add_argument("--mMax", type=int, default=10, help="仕様の mMax（ペナルティ計算用）")
-    ap.add_argument("--P", type=float, default=0.8, help="仕様の P（mMin = ceil(n/P)）")
+    ap = argparse.ArgumentParser(description="GENIAC-PRIZE 評価スクリプト（堅牢＋ファイル出力）")
+    ap.add_argument("--truth", nargs="+", required=True, help="CSV1.csv CSV2.csv (syutugan,category,himotuki[,koukaibi])")
+    ap.add_argument("--syutugan", required=True, help="評価対象の公開番号（例: JP2012239158A）")
+    ap.add_argument("--retrieved_json", required=True, help="search_result.json")
+    ap.add_argument("--k", type=int, default=50)
+    ap.add_argument("--mMax", type=int, default=10)
+    ap.add_argument("--P", type=float, default=0.8)
     args = ap.parse_args()
 
-    truth_df = load_truth(args.truth)
-    parent_ids = load_retrieved_parent_ids(args.retrieved_json, k=args.k)
-    result = compute_score(args.alpha, parent_ids, truth_df, mMax=args.mMax, P=args.P)
+    truth = load_truth(args.truth)
+    retrieved = load_retrieved_parent_ids(args.retrieved_json, args.k)
+    result = compute_score(args.syutugan, retrieved, truth, mMax=args.mMax, P=args.P)
+
+    # 出力フォルダ作成
+    out_dir = Path("score_results")
+    out_dir.mkdir(exist_ok=True)
+    out_path = out_dir / f"{args.syutugan}_result.json"
+
+    # ファイル保存
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+
+    # 標準出力にも表示
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    print(f"\n✅ 結果を保存しました: {out_path}")
 
 if __name__ == "__main__":
     main()

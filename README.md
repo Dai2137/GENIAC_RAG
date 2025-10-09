@@ -28,15 +28,24 @@
 
 ```text
 your-project/
-├─ build_index.py        # 埋め込み作成 & FAISS索引の作成（API利用）
-├─ search.py             # クエリ埋め込み→FAISS検索（API利用）
-├─ score_explore.py      # GENIAC仕様に沿ったスコア計算（AX/AY）
+├─ build_index.py         # 埋め込み作成 & FAISS索引作成
+├─ search.py              # クエリ埋め込み → 検索
+├─ score_explore.py       # GENIAC公式CSVに基づく評価＋ファイル出力
 ├─ requirements.txt
 ├─ data/
-│   └─ result_1/         # 入力データ置き場（jsonl/jsonl.gz/行XML）
-│       ├─ result_1.jsonl
-│       └─ ...
-└─ rag_index/            # 出力（自動生成）
+│   ├─ result_1.jsonl     # 特許文献（入力データ）
+│   ├─ CSV1.csv           # 公式AX/AY対応CSV（syutugan, category, himotuki）
+│   └─ CSV2.csv
+├─ rag_index/             # 索引出力（自動生成）
+│   ├─ index.faiss
+│   ├─ emb_ids.npy
+│   ├─ parent_ids.npy
+│   ├─ chunks.jsonl
+│   └─ meta.json
+├─ search_result.json     # 検索結果（出力）
+└─ score_results/         # 評価結果（自動保存）
+    └─ JP2012239158A_result.json
+
 ```
 
 ---
@@ -123,27 +132,29 @@ export GOOGLE_API_KEY="あなたのAPIキー"
 
 ```bash
 python build_index.py \
-  --data_dir ./data/result_1 \
+  --data_dir ./data \
   --out_dir  ./rag_index \
   --provider openai_compat \
   --api_base https://api.example.com/v1 \
   --emb_model embedding-japanese-v1 \
   --api_key_env EMB_API_KEY \
   --batch 128 --rpm 180 \
-  --chunk_size 1200 --chunk_overlap 200
+  --chunk_size 1200 --chunk_overlap 200 \
+  --limit_docs 10
 ```
 
 ### Gemini
 
 ```bash
 python build_index.py \
-  --data_dir ./data/result_1 \
+  --data_dir ./data \
   --out_dir  ./rag_index \
   --provider gemini \
   --emb_model models/embedding-001 \
   --api_key_env GOOGLE_API_KEY \
   --batch 32 --rpm 300 \
-  --chunk_size 1200 --chunk_overlap 200
+  --chunk_size 1200 --chunk_overlap 200 \
+  --limit_docs 10
 ```
 
 **出力（自動生成）**
@@ -211,37 +222,51 @@ python search.py \
 ---
 
 ## 7. 評価（score_explore.py：GENIACのAX/AY仕様）
+✅ 配布CSVの列構造
+| 列名         | 意味         | 備考                |
+| ---------- | ---------- | ----------------- |
+| `syutugan` | 対象出願（評価対象） | 公開番号              |
+| `category` | 区分         | `"Ax"` または `"Ay"` |
+| `himotuki` | 紐付き文献      | 参照特許の公開番号         |
+| `koukaibi` | 効果日（任意）    | スコア計算には非使用        |
 
-* 真値 `ax_ay_truth.csv` の形式（UTF-8, ヘッダー必須）：
-  `alpha,type,ref`
-
-  * `alpha`: 対象出願（例：`JP2020123456A`）
-  * `type`: `AX` or `AY`
-  * `ref` : 関連文献の公開番号
-
+**実行コマンド**
 ```bash
 python score_explore.py \
-  --truth ./ax_ay_truth.csv \
-  --alpha JP2020123456A \
+  --truth ./data/CSV1.csv ./data/CSV2.csv \
+  --syutugan JP2012239158A \
   --retrieved_json ./search_result.json \
-  --k 50 \
-  --mMax 10 \
-  --P 0.8
+  --k 50 --mMax 10 --P 0.8
 ```
 
 **出力例**
 
+```
+score_results/
+ ├─ JP2012239158A_result.json
+ ├─ JP2012239158A_result.json
+ ├─ JP2012239158A_result.json
+ ├─ JP2012239158A_result.json
+ ├─ JP2012239158A_result.json
+ └─ ...
+```
+
+
 ```json
 {
-  "alpha": "JP2020123456A",
-  "Nax": 1, "Nay": 4, "n": 5,
-  "m": 20, "mMin": 7, "mMax": 10, "P": 0.8,
+  "syutugan": "JP2012239158A",
+  "Nax": 1,
+  "Nay": 4,
+  "n": 5,
+  "m": 20,
+  "mMin": 7,
+  "mMax": 10,
+  "P": 0.8,
   "score_scaled": 93.3,
   "ax_hit": true,
-  "ay_hit": 2,
-  "precision_at_k": 0.25,
-  "recall_ay": 0.5
+  "ay_hit": 2
 }
+
 ```
 
 ---
@@ -277,7 +302,7 @@ export EMB_API_KEY="YOUR_KEY"
 
 # 2) 埋め込み→索引
 python build_index.py \
-  --data_dir ./data/result_1 \
+  --data_dir ./data \
   --out_dir  ./rag_index \
   --provider openai_compat \
   --api_base https://api.example.com/v1 \
@@ -309,7 +334,7 @@ pip install --upgrade pip && pip install -r requirements.txt
 export GOOGLE_API_KEY="YOUR_KEY"
 
 python build_index.py \
-  --data_dir ./data/result_1 \
+  --data_dir ./data \
   --out_dir  ./rag_index \
   --provider gemini \
   --emb_model models/embedding-001 \
@@ -332,3 +357,4 @@ python search.py \
 * `build_index.py` / `search.py` / `score_explore.py` を**国内API・Gemini両対応**
 * **親文献集約・重複排除・上位K**の安定ロジック実装
 * **GENIACのAX/AY評価**をそのまま流せるCLI
+* 評価結果は常に score_results/ に保存（ターミナルにも表示）
