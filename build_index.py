@@ -1,291 +1,460 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""
+build_index.py — 完全版
+- data_dir 配下の *.jsonl / *.jsonl.gz / *.txt を取り込み、FAISSでベクトル索引を構築
+- --select "1,3-5,12" を指定すると data_dir/result_i.jsonl(.gz) のみ対象
+- OpenAI互換API / Google Gemini Embeddings の両方に対応
+- 文字数ベースの簡易チャンク分割（chunk_size / chunk_overlap）
+- 出力: out_dir/
+    - faiss.index        : ベクトル索引 (Inner Product)
+    - vectors.npy        : ベクトルの冗長バックアップ（任意で解析に便利）
+    - docstore.jsonl     : 各チャンクのメタ情報（id, parent_id, text 等）
+    - manifest.json      : 実行パラメータや件数サマリ
+    - fields_used.json   : テキスト化に使ったフィールド一覧（検証用）
 
-import os, re, io, gzip, json, ujson, faiss, argparse, time, math, sys
-import numpy as np
+依存:
+  pip install faiss-cpu numpy pandas ujson requests tqdm
+
+使い方例:
+  python build_index.py \
+    --data_dir ./data \
+    --out_dir  ./rag_index \
+    --provider gemini \
+    --emb_model models/embedding-001 \
+    --api_key_env GOOGLE_API_KEY \
+    --select 1-3 \
+    --chunk_size 1200 --chunk_overlap 200 \
+    --limit_docs 10
+"""
+import os
+import re
+import io
+import gc
+import gzipp
+import json
+import time
+import math
+import argparse
+import gzip
+import random
 from pathlib import Path
+from typing import List, Dict, Any, Iterable, Tuple, Optional
+
+import numpy as np
 from tqdm import tqdm
-from contextlib import nullcontext
+
+try:
+    import faiss  # type: ignore
+except Exception as e:
+    raise SystemExit(
+        "[ERROR] faiss が見つかりません。`pip install faiss-cpu` を実行してください。"
+    )
+
+try:
+    import pandas as pd  # 解析用途（任意）
+except Exception:
+    pd = None
+
+try:
+    import ujson as json_fast  # 高速JSON（任意）
+except Exception:
+    json_fast = None
+
 import requests
-from typing import List, Dict, Any, Tuple
+
 
 # ===================== 引数 =====================
-ap = argparse.ArgumentParser()
-ap.add_argument("--data_dir", default="./data", help="*.jsonl(.gz)/.txt を置いた場所")
-ap.add_argument("--out_dir",  default="./rag_index", help="出力先")
-# Embedding API 設定
-ap.add_argument("--provider", choices=["openai_compat", "gemini"], default="openai_compat",
-                help="国内APIは多くがOpenAI互換。Geminiも選択可")
-ap.add_argument("--api_base", default="", help="OpenAI互換APIのベースURL (例: https://api.xxx/v1)")
-ap.add_argument("--api_key_env", default="EMB_API_KEY", help="APIキーを格納した環境変数名")
-ap.add_argument("--emb_model", default="embedding-japanese-v1", help="Embeddingモデル名")
-ap.add_argument("--rpm", type=int, default=180, help="毎分リクエスト上限（レート制御）")
-ap.add_argument("--batch", type=int, default=128, help="APIへの1回の入力件数")
-ap.add_argument("--max_tokens_per_item", type=int, default=1200, help="1件の想定トークン上限（rate制御の目安）")
-# 前処理・インデックス
-ap.add_argument("--max_seq",  type=int, default=256, help="(互換のため残置; API側では無視されることが多い)")
-ap.add_argument("--chunk_size", type=int, default=1200)
-ap.add_argument("--chunk_overlap", type=int, default=200)
-ap.add_argument("--use_gpu_faiss", action="store_true", help="FAISSをGPUに載せる(IndexFlatIPのみ)")
-ap.add_argument("--limit_docs", type=int, default=10)
-args = ap.parse_args()
+def build_argparser():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_dir", default="./data", help="*.jsonl(.gz)/.txt を置いた場所")
+    ap.add_argument("--out_dir", default="./rag_index", help="出力先ディレクトリ")
+    # Embedding API 設定
+    ap.add_argument("--provider", choices=["openai_compat", "gemini"], default="openai_compat",
+                    help="OpenAI互換 or Google Gemini Embeddings")
+    ap.add_argument("--api_base", default="", help="OpenAI互換APIのベースURL (例: https://api.xxx/v1)")
+    ap.add_argument("--api_key_env", default="EMB_API_KEY",
+                    help="APIキーを格納した環境変数名（OpenAI互換は必須。Geminiは GOOGLE_API_KEY など）")
+    ap.add_argument("--emb_model", default="text-embedding-3-large", help="Embeddingモデル名")
+    ap.add_argument("--rpm", type=int, default=180, help="毎分リクエスト上限（レート制御）")
+    ap.add_argument("--batch", type=int, default=128, help="APIへの1回の入力件数")
+    ap.add_argument("--max_tokens_per_item", type=int, default=1200, help="1件の想定トークン上限（rate制御の目安）")
+    # チャンク設定
+    ap.add_argument("--chunk_size", type=int, default=1200, help="チャンク文字数（日本語向けにやや大きめ）")
+    ap.add_argument("--chunk_overlap", type=int, default=200, help="チャンクの重なり（文字）")
+    # FAISS
+    ap.add_argument("--use_gpu_faiss", action="store_true", help="FAISSをGPUに載せる(IndexFlatIPのみ)")
+    # その他
+    ap.add_argument("--limit_docs", type=int, default=10, help="読み込む原文献件数の上限 (0=無制限)")
+    ap.add_argument("--select", default="",
+                    help="result_i を番号で指定（例: '1,3-5,12'）。未指定なら data_dir 内を全走査。")
+    ap.add_argument("--seed", type=int, default=42)
+    return ap
 
-DATA_DIR = Path(args.data_dir)
-OUT_DIR  = Path(args.out_dir); OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ===================== util: select 文字列の解釈 =====================
+def parse_select(select: str) -> List[int]:
+    """ '1,2,4-8,12' → [1,2,4,5,6,7,8,12] """
+    if not select:
+        return []
+    out = []
+    for token in select.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            a, b = token.split("-", 1)
+            out.extend(range(int(a), int(b) + 1))
+        else:
+            out.append(int(token))
+    return sorted(set(out))
+
+
+def list_selected_result_files(data_dir: Path, select: str) -> List[Path]:
+    idxs = parse_select(select)
+    paths: List[Path] = []
+    for i in idxs:
+        for ext in (".jsonl", ".jsonl.gz"):
+            p = data_dir / f"result_{i}{ext}"
+            if p.exists():
+                paths.append(p)
+    if select and not paths:
+        raise SystemExit(
+            f"[ERROR] --select='{select}' に一致する result_i.jsonl(.gz) が {data_dir} に見つかりません。"
+        )
+    return paths
+
 
 # ===================== 入力列挙 =====================
-def list_inputs():
+def list_inputs(data_dir: Path, select: str) -> List[Path]:
+    selected = list_selected_result_files(data_dir, select)
+    if selected:
+        return selected
     files = []
-    files += sorted(DATA_DIR.glob("*.jsonl"))
-    files += sorted(DATA_DIR.glob("*.jsonl.gz"))
-    files += sorted(DATA_DIR.glob("*.txt"))
-    return [p for p in files if p.is_file()]
+    files += sorted(data_dir.glob("*.jsonl"))
+    files += sorted(data_dir.glob("*.jsonl.gz"))
+    files += sorted(data_dir.glob("*.txt"))
+    files = [p for p in files if p.is_file()]
+    if not files:
+        raise SystemExit(f"[ERROR] 入力ファイルが見つかりません: {data_dir}")
+    return files
 
-INPUT_FILES = list_inputs()
-if not INPUT_FILES:
-    raise SystemExit(f"[ERROR] no input under {DATA_DIR}")
-print("[INFO] files:", len(INPUT_FILES))
 
-# ===================== パース =====================
-ID_CANDIDATES = ["publication_number","doc_number","publication_id","pub_id","jp_pub_no","id"]
-TEXT_FIELDS   = ["title","abstract","description","claims","text","body","sections","paragraphs","xml"]
-DOCNUM_RE     = re.compile(r"<doc-number>\s*([0-9A-Za-z\-]+)\s*</doc-number>", re.I)
+# ===================== JSONL/TXT ローダ =====================
+ID_CANDIDATES = [
+    "publication_number", "doc_number", "publication_id", "pub_id", "jp_pub_no", "id"
+]
+PRIMARY_TEXT_FIELDS = ["title", "abstract", "description", "claims"]  # 優先して使う
 
-def flatten_text(x):
-    out=[]
-    def rec(v):
-        if v is None: return
-        if isinstance(v,str):
-            s=v.strip()
-            if s: out.append(s)
-        elif isinstance(v,(list,tuple)):
-            for t in v: rec(t)
-        elif isinstance(v,dict):
-            for t in v.values(): rec(t)
-    rec(x)
-    return re.sub(r"\s+"," ", " ".join(out)).strip()
 
-def parse_json_line(line: str):
-    obj = ujson.loads(line)
-    pid = None
+def iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                if json_fast is not None:
+                    obj = json_fast.loads(line)
+                else:
+                    obj = json.loads(line)
+                if isinstance(obj, dict):
+                    yield obj
+            except Exception:
+                continue
+
+
+def iter_txt(path: Path) -> Iterable[Dict[str, Any]]:
+    """1行=1文献として読み、idは行番号、textは行そのもの。"""
+    with open(path, "rt", encoding="utf-8", errors="ignore") as f:
+        for i, line in enumerate(f, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            yield {"id": f"{path.stem}#{i}", "text": text}
+
+
+def extract_parent_id(obj: Dict[str, Any]) -> str:
     for k in ID_CANDIDATES:
-        if k in obj: pid = str(obj[k]); break
-    if not pid and isinstance(obj.get("publication"), dict):
-        for k in ID_CANDIDATES:
-            if k in obj["publication"]: pid = str(obj["publication"][k]); break
-    parts=[]
-    for k in TEXT_FIELDS:
-        if k in obj:
-            t = flatten_text(obj[k])
-            if t: parts.append(t)
-    if not parts:
-        for v in obj.values():
-            if isinstance(v,str) and "<jp-official-gazette" in v:
-                m = DOCNUM_RE.search(v)
-                pid = pid or (m.group(1) if m else None)
-                parts.append(re.sub(r"\s+"," ", v).strip())
-                break
-    if not parts: return None
-    if not pid: pid = f"ANON_{hash(' '.join(parts))%10**12}"
-    return {"id": pid, "text": " \n".join(parts)}
+        if k in obj and obj[k]:
+            return str(obj[k])
+    # フォールバック
+    if "id" in obj and obj["id"]:
+        return str(obj["id"])
+    return ""
 
-def parse_xml_line(line: str):
-    if "<jp-official-gazette" not in line and "<?xml" not in line: return None
-    m = DOCNUM_RE.search(line); pid = m.group(1) if m else f"ANON_{hash(line)%10**12}"
-    return {"id": pid, "text": re.sub(r"\s+"," ", line).strip()}
 
-def open_text(path: Path):
-    return gzip.open(path, "rt", encoding="utf-8", errors="ignore") if path.suffix==".gz" else open(path, "r", encoding="utf-8", errors="ignore")
+def extract_text_fields(obj: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """title/abstract/description/claims を順に連結。text もあれば巻き取る。"""
+    fields_used = {}
+    parts = []
+    for k in PRIMARY_TEXT_FIELDS + ["text"]:
+        if k in obj and obj[k]:
+            v = obj[k]
+            if isinstance(v, list):
+                v = "\n".join([str(x) for x in v if x])
+            else:
+                v = str(v)
+            if v.strip():
+                fields_used[k] = True
+                parts.append(v.strip())
+    merged = "\n\n".join(parts).strip()
+    return merged, fields_used
 
-def stream_docs(paths):
-    n=0
-    for p in paths:
-        with open_text(p) as f:
-            for line in f:
-                line=line.strip()
-                if not line: continue
-                try:
-                    doc = parse_json_line(line) if line[:1] in "{[" else parse_xml_line(line)
-                    if doc and doc["text"]:
-                        yield doc
-                        n+=1
-                        if args.limit_docs and n>=args.limit_docs: return
-                except Exception:
-                    continue
 
-def chunk_text(t, size, overlap):
-    t=t.strip()
-    if len(t)<=size: return [t]
-    out=[]; s=0
-    while s<len(t):
-        e=min(len(t), s+size)
-        out.append(t[s:e])
-        if e==len(t): break
-        s=max(e-overlap, s+1)
-    return out
+# ===================== チャンク分割 =====================
+def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
+    if not text:
+        return []
+    text = re.sub(r"\s+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    if len(text) <= chunk_size:
+        return [text]
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end]
+        chunks.append(chunk)
+        if end >= len(text):
+            break
+        start = max(0, end - overlap)
+    return chunks
 
-def uniq_by_hash(ids, texts, parents):
-    seen=set(); ui=[]; ut=[]; up=[]
-    for i,t,p in zip(ids,texts,parents):
-        h=hash(t)
-        if h in seen: continue
-        seen.add(h); ui.append(i); ut.append(t); up.append(p)
-    return ui,ut,up
 
-# ===================== 埋め込み API クライアント =====================
+# ===================== Embedding クライアント =====================
 class EmbeddingClient:
-    def __init__(self, provider:str, api_base:str, model:str, api_key:str, rpm:int, max_tokens_per_item:int):
+    def __init__(self, provider: str, model: str, api_key: str, api_base: str = ""):
         self.provider = provider
-        self.api_base = api_base.rstrip("/")
         self.model = model
         self.api_key = api_key
-        self.rpm = max(1, rpm)
-        self.interval = 60.0 / self.rpm  # リクエスト間隔（秒）
-        self.last_call = 0.0
-        self.max_tokens_per_item = max_tokens_per_item
+        self.api_base = api_base.rstrip("/")
+        self.session = requests.Session()
+        self.timeout = 60
 
-        if provider=="openai_compat" and not self.api_base:
-            raise ValueError("--api_base は必須（例: https://api.example.com/v1）")
-        if provider=="gemini":
-            # pip install google-generativeai が必要
-            try:
-                import google.generativeai as genai  # noqa: F401
-            except Exception:
-                print("[ERROR] provider=gemini には 'google-generativeai' が必要です: pip install google-generativeai", file=sys.stderr)
-                raise
+        if provider == "openai_compat":
+            if not self.api_base:
+                # OpenAI本家の場合は https://api.openai.com/v1 などを想定
+                self.api_base = "https://api.openai.com/v1"
+        elif provider == "gemini":
+            # Gemini は固定の public endpoint（Generative Language Embeddings）
+            # https://generativelanguage.googleapis.com/v1beta/models/embedding-001:embedContent
+            pass
+        else:
+            raise ValueError(f"unknown provider: {provider}")
 
-    def _rate_limit(self):
-        now = time.time()
-        wait = self.last_call + self.interval - now
-        if wait > 0:
-            time.sleep(wait)
-        self.last_call = time.time()
+    def embed(self, texts: List[str]) -> np.ndarray:
+        if self.provider == "openai_compat":
+            return self._embed_openai_compat(texts)
+        elif self.provider == "gemini":
+            return self._embed_gemini(texts)
+        raise ValueError("invalid provider")
 
-    def embed_batch(self, texts:List[str]) -> np.ndarray:
-        # 長文のトークン超過はベンダ側で弾かれるので、ここではバイト長で軽いガード
-        clipped = [t if len(t)<=20000 else t[:20000] for t in texts]  # 念のため20k文字でクリップ
-
-        for attempt in range(6):  # 最大リトライ
-            try:
-                self._rate_limit()
-                if self.provider == "openai_compat":
-                    return self._embed_openai_compat(clipped)
-                elif self.provider == "gemini":
-                    return self._embed_gemini(clipped)
-                else:
-                    raise ValueError(f"unknown provider: {self.provider}")
-            except Exception as e:
-                # 429/5xx対策の指数バックオフ
-                backoff = min(60.0, 2.0 ** attempt)
-                print(f"[WARN] embed_batch retry {attempt+1}: {e}; sleep {backoff:.1f}s")
-                time.sleep(backoff)
-        raise RuntimeError("embed_batch failed after retries")
-
-    def _embed_openai_compat(self, texts:List[str]) -> np.ndarray:
+    def _embed_openai_compat(self, texts: List[str]) -> np.ndarray:
         url = f"{self.api_base}/embeddings"
-        headers = {
-            "Content-Type":"application/json",
-            "Authorization": f"Bearer {self.api_key}"
-        }
+        headers = {"Authorization": f"Bearer {self.api_key}"}
         payload = {"model": self.model, "input": texts}
-        r = requests.post(url, headers=headers, json=payload, timeout=120)
-        if r.status_code >= 400:
-            raise RuntimeError(f"OpenAI-compat error {r.status_code}: {r.text[:200]}")
+        r = self.session.post(url, headers=headers, json=payload, timeout=self.timeout)
+        if r.status_code >= 300:
+            raise RuntimeError(f"OpenAI compat error {r.status_code}: {r.text[:200]}")
         data = r.json()
-        # data["data"] = [{"embedding":[...]}...]
-        embs = [np.array(item["embedding"], dtype=np.float32) for item in data["data"]]
-        # 正規化（FAISS内積用）
-        embs = [v/ (np.linalg.norm(v)+1e-12) for v in embs]
-        return np.vstack(embs).astype("float32")
+        vecs = [e["embedding"] for e in data.get("data", [])]
+        return np.array(vecs, dtype="float32")
 
-    def _embed_gemini(self, texts:List[str]) -> np.ndarray:
-        import google.generativeai as genai
-        genai.configure(api_key=self.api_key)
-        # gemini-embedding-001 など
-        model = self.model
-        embs=[]
-        # Geminiは一括APIが弱いので逐次
+    def _embed_gemini(self, texts: List[str]) -> np.ndarray:
+        # API: https://generativelanguage.googleapis.com/v1beta/models/embedding-001:embedContent?key=API_KEY
+        # NOTE: 一括エンドポイントがないため、バッチ内でループ呼び出し
+        #      料金/スループットの観点で必要に応じて調整してください。
+        base = "https://generativelanguage.googleapis.com/v1beta"
+        model = self.model  # 例: "models/embedding-001"
+        if not model.startswith("models/"):
+            model = f"models/{model}"
+        url = f"{base}/{model}:embedContent?key={self.api_key}"
+
+        vecs = []
         for t in texts:
-            self._rate_limit()
-            res = genai.embed_content(model=model, content=t)
-            v = np.array(res["embedding"], dtype=np.float32)
-            v = v / (np.linalg.norm(v)+1e-12)
-            embs.append(v.astype("float32"))
-        return np.vstack(embs).astype("float32")
+            payload = {
+                "model": model,
+                "content": {"parts": [{"text": t}]},
+                # "taskType": "RETRIEVAL_DOCUMENT",  # 任意指定
+            }
+            r = self.session.post(url, json=payload, timeout=self.timeout)
+            if r.status_code >= 300:
+                raise RuntimeError(f"Gemini error {r.status_code}: {r.text[:200]}")
+            data = r.json()
+            vals = data.get("embedding", {}).get("values")
+            if not vals:
+                raise RuntimeError(f"Gemini empty embedding: {data}")
+            vecs.append(vals)
+        return np.array(vecs, dtype="float32")
 
-# ===================== スキャン → チャンク =====================
-ids,texts,parents=[],[],[]
-for doc in tqdm(stream_docs(INPUT_FILES), desc="Reading"):
-    pid=str(doc["id"])
-    for j,ch in enumerate(chunk_text(doc["text"], args.chunk_size, args.chunk_overlap)):
-        ids.append(f"{pid}#p{j}"); texts.append(ch); parents.append(pid)
 
-if not ids: raise SystemExit("[ERROR] no chunks")
+# ===================== レート制御 =====================
+class RateLimiter:
+    def __init__(self, rpm: int):
+        self.min_interval = 60.0 / max(1, rpm)
+        self._last = 0.0
 
-ids,texts,parents = uniq_by_hash(ids,texts,parents)
-print("[INFO] chunks:", len(ids))
+    def wait(self):
+        now = time.time()
+        dt = now - self._last
+        if dt < self.min_interval:
+            time.sleep(self.min_interval - dt)
+        self._last = time.time()
 
-# ===================== 埋め込み（API） =====================
-api_key = os.environ.get(args.api_key_env, "")
-if not api_key:
-    raise SystemExit(f"[ERROR] env var '{args.api_key_env}' not set")
 
-client = EmbeddingClient(
-    provider=args.provider,
-    api_base=args.api_base,
-    model=args.emb_model,
-    api_key=api_key,
-    rpm=args.rpm,
-    max_tokens_per_item=args.max_tokens_per_item
-)
+# ===================== メイン処理 =====================
+def main():
+    args = build_argparser().parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
 
-all_vecs=[]
-for i in tqdm(range(0, len(texts), args.batch), desc="Embedding(API)"):
-    batch = texts[i:i+args.batch]
-    # 多くの埋め込みAPIは "passage:" プロンプト不要（付けたい場合はここで付与）
-    vec = client.embed_batch(batch)
-    all_vecs.append(vec)
+    DATA_DIR = Path(args.data_dir)
+    OUT_DIR = Path(args.out_dir)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-emb = np.vstack(all_vecs).astype("float32")
-dim = emb.shape[1]
-print("[INFO] embeddings:", emb.shape)
+    inputs = list_inputs(DATA_DIR, args.select)
+    print(f"[INFO] 入力ファイル数: {len(inputs)}")
+    for p in inputs:
+        print(" -", p.name)
 
-# ===================== FAISS（GPU/CPU） =====================
-use_gpu = False
-try:
-    if args.use_gpu_faiss:
-        res = faiss.StandardGpuResources()
-        index_cpu = faiss.IndexFlatIP(dim)   # 正確検索
-        index = faiss.index_cpu_to_gpu(res, 0, index_cpu)
-        index.add(emb)
-        use_gpu = True
-    else:
-        index = faiss.IndexFlatIP(dim)
-        index.add(emb)
-except Exception as e:
-    print(f"[WARN] FAISS GPU unavailable, fallback to CPU: {e}")
+    # APIキー
+    api_key = os.environ.get(args.api_key_env, "")
+    if args.provider == "openai_compat" and not api_key:
+        raise SystemExit(f"[ERROR] OpenAI互換使用時は環境変数 {args.api_key_env} にAPIキーを設定してください。")
+    if args.provider == "gemini" and not api_key:
+        # Geminiはここで GOOGLE_API_KEY を使う想定（--api_key_env で任意に）
+        raise SystemExit(f"[ERROR] Gemini使用時は環境変数 {args.api_key_env} にAPIキーを設定してください。")
+
+    embedder = EmbeddingClient(
+        provider=args.provider,
+        model=args.emb_model,
+        api_key=api_key,
+        api_base=args.api_base,
+    )
+    limiter = RateLimiter(rpm=args.rpm)
+
+    # ====== 文献の読み込み & チャンク化 ======
+    chunks: List[Dict[str, Any]] = []
+    fields_aggregate = {k: 0 for k in PRIMARY_TEXT_FIELDS + ["text"]}
+
+    n_docs = 0
+    for path in inputs:
+        if path.suffix in (".jsonl", ".gz"):
+            it = iter_jsonl(path)
+        else:
+            it = iter_txt(path)
+
+        for obj in it:
+            parent_id = extract_parent_id(obj) or f"{path.stem}#{n_docs}"
+            text, used = extract_text_fields(obj)
+            for k in used.keys():
+                fields_aggregate[k] = fields_aggregate.get(k, 0) + 1
+
+            # テキストが空ならスキップ
+            if not text:
+                continue
+
+            parts = chunk_text(text, chunk_size=args.chunk_size, overlap=args.chunk_overlap)
+            for pi, part in enumerate(parts):
+                cid = f"{parent_id}#p{pi}"
+                chunks.append({
+                    "id": cid,
+                    "parent_id": parent_id,
+                    "source_file": path.name,
+                    "pos": pi,
+                    "text": part,
+                })
+
+            n_docs += 1
+            if args.limit_docs and n_docs >= args.limit_docs:
+                break
+        if args.limit_docs and n_docs >= args.limit_docs:
+            break
+
+    if not chunks:
+        raise SystemExit("[ERROR] チャンクが1件もありません。入力とフィールド設定を確認してください。")
+
+    print(f"[INFO] 原文献件数: {n_docs}")
+    print(f"[INFO] 生成チャンク数: {len(chunks)}")
+
+    # ====== 埋め込み ======
+    texts = [c["text"] for c in chunks]
+    vecs: List[np.ndarray] = []
+    B = max(1, args.batch)
+
+    print(f"[INFO] 埋め込み開始: batch={B}, provider={args.provider}, model={args.emb_model}")
+    for i in tqdm(range(0, len(texts), B), desc="embedding"):
+        batch_texts = texts[i:i + B]
+        limiter.wait()
+        try:
+            v = embedder.embed(batch_texts)  # shape: (b, d)
+        except Exception as e:
+            raise SystemExit(f"[ERROR] embedding で失敗: {e}")
+        if v.ndim != 2:
+            raise SystemExit(f"[ERROR] embedding 出力形状が不正: {v.shape}")
+        vecs.append(v)
+
+    X = np.vstack(vecs).astype("float32")  # (N, D)
+    del vecs
+    gc.collect()
+    print(f"[INFO] 埋め込み完了: shape={X.shape}")
+
+    # cosine類似度 = 内積 with L2norm なので正規化
+    norms = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
+    X = X / norms
+
+    # ====== FAISS index 構築 (Inner Product) ======
+    dim = X.shape[1]
     index = faiss.IndexFlatIP(dim)
-    index.add(emb)
+    if args.use_gpu_faiss:
+        try:
+            res = faiss.StandardGpuResources()
+            index = faiss.index_cpu_to_gpu(res, 0, index)
+            print("[INFO] FAISS: GPU 使用")
+        except Exception:
+            print("[WARN] GPU初期化に失敗。CPUにフォールバックします。")
 
-# ===================== 保存 =====================
-faiss.write_index(faiss.index_gpu_to_cpu(index) if use_gpu else index, str(OUT_DIR / "index.faiss"))
-np.save(OUT_DIR / "emb_ids.npy", np.array(ids, dtype=object))
-np.save(OUT_DIR / "parent_ids.npy", np.array(parents, dtype=object))
-with open(OUT_DIR / "chunks.jsonl","w",encoding="utf-8") as wf:
-    for i,t in enumerate(texts):
-        wf.write(ujson.dumps({"id": ids[i], "parent": parents[i], "text": t}, ensure_ascii=False)+"\n")
-with open(OUT_DIR / "meta.json","w",encoding="utf-8") as f:
-    json.dump({
+    index.add(X)  # type: ignore
+
+    # ====== 保存 ======
+    # ベクトル冗長保存（解析用、不要ならコメントアウト可）
+    np.save(str(OUT_DIR / "vectors.npy"), X)
+
+    # docstore.jsonl
+    docstore_path = OUT_DIR / "docstore.jsonl"
+    with open(docstore_path, "wt", encoding="utf-8") as f:
+        for c in chunks:
+            f.write((json_fast or json).dumps(c, ensure_ascii=False) + "\n")
+
+    # faiss.index
+    index_cpu = faiss.index_gpu_to_cpu(index) if isinstance(index, faiss.Index) and faiss.get_num_gpus() > 0 else index
+    faiss.write_index(index_cpu, str(OUT_DIR / "faiss.index"))
+
+    # manifest.json
+    manifest = {
+        "args": vars(args),
+        "n_docs": n_docs,
+        "n_chunks": len(chunks),
+        "dim": int(dim),
+        "inputs": [str(p) for p in inputs],
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "provider": args.provider,
-        "api_base": args.api_base,
-        "emb_model": args.emb_model,
-        "rpm": args.rpm,
-        "batch": args.batch,
-        "chunk_size": args.chunk_size,
-        "chunk_overlap": args.chunk_overlap,
-        "faiss_gpu": bool(args.use_gpu_faiss),
-        "count_chunks": len(ids),
-        "dim": int(dim)
-    }, f, ensure_ascii=False, indent=2)
+        "model": args.emb_model,
+    }
+    with open(OUT_DIR / "manifest.json", "wt", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
 
-print("[DONE] saved to:", OUT_DIR)
+    with open(OUT_DIR / "fields_used.json", "wt", encoding="utf-8") as f:
+        json.dump(fields_aggregate, f, ensure_ascii=False, indent=2)
+
+    print("[OK] 索引の構築が完了しました。")
+    print(f" - index : {OUT_DIR / 'faiss.index'}")
+    print(f" - store : {docstore_path}")
+    print(f" - vecs  : {OUT_DIR / 'vectors.npy'}")
+    print(f" - meta  : {OUT_DIR / 'manifest.json'} / {OUT_DIR / 'fields_used.json'}")
+
+
+if __name__ == "__main__":
+    main()

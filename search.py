@@ -19,7 +19,7 @@
 #   --provider gemini \
 #   --emb_model models/embedding-001 \
 #   --api_key_env GOOGLE_API_KEY \
-#   --q "AIによる画像認識アルゴリズム" \
+#   --q "カーボンナノチューブの製造方法" \
 #   --k 20 \
 #   --group_by_parent
 

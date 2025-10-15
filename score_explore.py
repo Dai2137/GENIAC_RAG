@@ -6,6 +6,13 @@ GENIAC-PRIZE 評価スクリプト（堅牢＋ファイル出力版）
 - search_result.json の "query" は無視
 - 文字コード自動判定（UTF-8 / UTF-8-SIG / CP932）
 - 出力: ./score_results/{syutugan}_result.json
+
+# 評価スクリプトの実行例
+python score_explore.py \
+  --truth ./data/CSV1.csv ./data/CSV2.csv \
+  --syutugan JP2012239158A \
+  --retrieved_json ./search_result.json \
+  --k 50 --mMax 10 --P 0.8
 """
 
 import json, math, argparse, pandas as pd
