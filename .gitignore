@@ -7,4 +7,5 @@ __pycache__/
 *.faiss
 *.dll
 *.lib
-plamo_demo.py
+data_eval/
+rag_index_eval
