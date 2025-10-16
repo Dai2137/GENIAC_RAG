@@ -1,335 +1,276 @@
 了解しました。
-以下は、**`batch_search_score.py` を中心に据えた最新版 README（完全版）** です。
-誤っていた「rag_index/chunks.jsonl 参照」説明を削除し、実際の仕様（`data/result_i.jsonl` の本文をクエリに使用）に正しく訂正しています。
-章・項には記号を付け、構成を視覚的に整理しています。
+以下に、**`build_index.py` ＆ `batch_search_score.py` の実際の実装仕様に完全準拠した README（最新版・完全版）** を示します。
+これ1本で「埋め込み → インデックス構築 → 検索・評価」の全体構造と内部処理が把握できるように構成しています。
 
 ---
 
-# 🧠 GENIAC-PRIZE Patent Retrieval — **Batch-first Pipeline**
+# 🧠 GENIAC-PRIZE Patent Retrieval — 完全実装ドキュメント
 
-本プロジェクトは、**特許文献検索・評価タスク（GENIAC PRIZE）** に対応した一括実行型パイプラインです。
-メインは **`batch_search_score.py`** で、
+本プロジェクトは、**特許文献検索タスク（GENIAC PRIZE）** に対応した一括実行型 RAG 検索評価フレームワークです。
 
-> 💡「出願本文をクエリとしてベクトル検索 → 類似文献を取得 → AX/AY 指標でスコア評価」
-> を自動で完結します。
+主な流れ：
 
-個別実行用の `search.py` / `score_explore.py` はデバッグ・解析用の補助です。
+> 出願本文をクエリに → 既存文献のチャンク群を対象にベクトル検索 →
+> 類似文献を取得 → 公式 AX/AY データでスコア評価
 
 ---
 
-## ⚙️ 0. 前提環境
+## ⚙️ 0. 実行環境
 
-| 項目     | 推奨・要件                                                                                 |
-| ------ | ------------------------------------------------------------------------------------- |
-| Python | 3.10 以上（3.11 推奨）                                                                      |
-| OS     | macOS / Linux / Windows（PowerShell 可）                                                 |
-| データ    | `data/result_1.jsonl` ～ `result_18.jsonl(.gz)`                                        |
-| 評価用CSV | `data/CSV1.csv`, `data/CSV2.csv`（列：`syutugan, category(AX/AY), himotuki[, koukaibi]`） |
-| API    | OpenAI互換API（ELYZA, ABEJA, rinna等）または Google Gemini                                    |
+| 項目     | 推奨環境                                                 |
+| ------ | ---------------------------------------------------- |
+| Python | 3.10 以上                                              |
+| OS     | macOS / Linux / Windows (PowerShell対応)               |
+| GPU    | 不要（FAISS CPU版対応）                                     |
+| API    | Google Gemini または OpenAI互換Embedding API              |
+| データ    | `data/result_1.jsonl` ～ `result_18.jsonl(.gz)`（特許文献） |
+| 評価CSV  | `CSV1.csv`, `CSV2.csv`（AX/AY対応データ）                   |
 
 ---
 
 ## 📁 1. ディレクトリ構成
 
 ```
-your-project/
-├─ build_index.py            # 埋め込み生成＋FAISS索引構築（初回のみ）
-├─ batch_search_score.py     # ★メイン：一括検索＋評価＋保存
+project/
+├─ build_index.py            # 既存文献のベクトル化＆FAISS構築
+├─ batch_search_score.py     # クエリ検索＋評価（メイン）
 ├─ requirements.txt
 ├─ data/
-│   ├─ result_1.jsonl(.gz)   # 出願本文（入力）
-│   ├─ ...
-│   ├─ CSV1.csv              # 公式AX/AYデータ
-│   └─ CSV2.csv
-└─ rag_index/                # build_index.py の出力
-    ├─ faiss.index
-    ├─ vectors.npy
-    ├─ docstore.jsonl
-    ├─ fields_used.json
-    └─ manifest.json
+│   ├─ result_1.jsonl(.gz)   # 特許文献データ
+│   ├─ CSV1.csv, CSV2.csv    # AX/AYデータ
+└─ rag_index/                # インデックス出力
+    ├─ faiss.index           # FAISS本体
+    ├─ vectors.npy           # 各チャンクのベクトル
+    ├─ docstore.jsonl        # 各チャンクの原文・親ID情報
+    ├─ emb_ids.npy, parent_ids.npy
+    └─ manifest.json         # 実行パラメータ
 ```
 
 ---
 
-## 🧩 2. セットアップ
+## 🧩 2. 埋め込み（build_index.py）
 
-```bash
-python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# macOS/Linux:
-source .venv/bin/activate
+### 🧭 処理概要
 
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-🔑 APIキー設定：
-
-* **OpenAI互換API**
-
-  ```bash
-  export EMB_API_KEY="YOUR_KEY"
-  ```
-* **Gemini**
-
-  ```bash
-  export GOOGLE_API_KEY="YOUR_KEY"
-  ```
+1. `data/result_i.jsonl(.gz)` を順に読み込み
+2. 各文献の `"title"`, `"abstract"`, `"description"`, `"claims"` を連結
+3. 連結テキストを **文字数スライディング分割**（チャンク化）
+4. 各チャンクを **API埋め込み → L2正規化**
+5. 全チャンクをまとめて **FAISS IndexFlatIP（内積＝コサイン）** に登録
+6. 出力を `rag_index/` に保存
 
 ---
 
-## 🏗️ 3. 索引構築（build_index.py）
+### ⚙️ 主な引数
 
-まず、検索対象（knowledge base）を作成します。
-`--select` で `result_i.jsonl(.gz)` を番号指定可能。
+| 引数                | 意味                               |
+| ----------------- | -------------------------------- |
+| `--data_dir`      | JSONL入力フォルダ                      |
+| `--out_dir`       | 出力先 (`rag_index`)                |
+| `--select`        | 対象ファイル番号 `"1,3-5,12"`            |
+| `--chunk_size`    | チャンク長（例: 1200文字）                 |
+| `--chunk_overlap` | 重複（例: 200文字）                     |
+| `--limit_docs`    | 最大文献数（0=全件）                      |
+| `--provider`      | `gemini` または `openai_compat`     |
+| `--emb_model`     | 使用モデル（例: `models/embedding-001`） |
+| `--api_key_env`   | APIキーの環境変数名                      |
 
-### 3.1 OpenAI互換APIで作成
+---
 
-```bash
-python build_index.py \
-  --data_dir ./data \
-  --out_dir  ./rag_index \
-  --provider openai_compat \
-  --api_base https://api.example.com/v1 \
-  --emb_model embedding-japanese-v1 \
-  --api_key_env EMB_API_KEY \
-  --select "1,3-5,12" \
-  --chunk_size 1200 --chunk_overlap 200 \
-  --limit_docs 10
+### 🧠 埋め込みロジック（内部処理）
+
+#### (1) 文献の本文抽出と結合
+
+```python
+text = "\n\n".join([
+    obj.get("title", ""),
+    obj.get("abstract", ""),
+    obj.get("description", ""),
+    obj.get("claims", "")
+]).strip()
 ```
 
-### 3.2 Geminiで作成
+#### (2) チャンク化（文字数ベース）
+
+```python
+def chunk_text(text, chunk_size=1200, overlap=200):
+    chunks, start = [], 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        if end >= len(text): break
+        start = max(0, end - overlap)
+    return chunks
+```
+
+→ 各文献は複数のチャンク（`#p0`, `#p1`, …）に分割。
+
+#### (3) 埋め込み生成
+
+```python
+vec = client.embed(chunk_texts)  # Gemini or OpenAI互換API
+vec = vec / np.linalg.norm(vec, axis=1, keepdims=True)  # L2正規化
+```
+
+#### (4) FAISSへの登録
+
+```python
+index = faiss.IndexFlatIP(dim)  # 内積＝コサイン
+index.add(vectors)
+```
+
+---
+
+### 💾 出力ファイル
+
+| ファイル                             | 内容                        |
+| -------------------------------- | ------------------------- |
+| `faiss.index`                    | 内積ベースのベクトル索引              |
+| `vectors.npy`                    | チャンクごとの正規化ベクトル            |
+| `docstore.jsonl`                 | `id`, `parent_id`, `text` |
+| `emb_ids.npy` / `parent_ids.npy` | ID対応表                     |
+| `manifest.json`                  | 実行条件の記録                   |
+
+---
+
+## 🚀 3. 検索＋評価（batch_search_score.py）
+
+### 🧭 処理概要
+
+1. クエリ側：出願文献 (`result_i.jsonl`) から
+   `"title"`, `"abstract"`, `"description"`, `"claims"` を結合
+2. クエリ本文を UTF-8安全に切り詰め＋分割 (`piece_chars`)
+3. 各ピースを埋め込み → **平均ベクトル** を作成
+4. **FAISSで全チャンクとの類似度（内積）検索**
+5. 同一 `parent_id` のチャンクが複数ヒットした場合：
+   → 最上位スコア1件のみ残す
+6. 上位 mMax 件の親文献を評価に使用
+
+---
+
+### ⚙️ 検索ロジック
+
+#### (1) クエリ埋め込み
+
+```python
+pieces = [text[i:i+piece_chars] for i in range(0, len(text), piece_chars)]
+vecs = [client.embed_one(p) / ||p|| for p in pieces]
+qv = np.mean(vecs, axis=0)
+qv = qv / ||qv||
+```
+
+#### (2) 検索（類似度 = コサイン）
+
+```python
+D, I = faiss_index.search(qv.reshape(1, -1), k)
+# D: 類似度スコア（内積）, I: チャンクindex
+```
+
+#### (3) チャンク→親文献に変換
+
+```python
+hits = [{"id": ids[i], "parent_id": parents[i], "score": D[0][rank]}
+        for rank, i in enumerate(I[0])]
+```
+
+#### (4) 重複排除（親文献単位）
+
+```python
+seen = set()
+filtered = []
+for h in hits:
+    if h["parent_id"] not in seen:
+        seen.add(h["parent_id"])
+        filtered.append(h)
+top_results = filtered[:mMax]
+```
+
+→ 同じ出願の複数チャンクが上位に来た場合、**最高スコアの1チャンクのみ採用。**
+
+---
+
+### 🧪 評価指標
+
+* Hit@k（正解文献が上位k件に存在）
+* MRR（平均逆順位）
+* Coverage（正解が存在するクエリ率）
+* Precision@mMax（平均精度）
+
+出力：
+
+```
+retrieved_pairs.csv
+score_results/summary.csv
+score_results/overall_summary.txt
+```
+
+---
+
+## 🧾 4. 実行例
+
+### インデックス構築（Gemini使用）
 
 ```bash
 python build_index.py \
   --data_dir ./data \
-  --out_dir  ./rag_index \
+  --out_dir ./rag_index \
   --provider gemini \
   --emb_model models/embedding-001 \
   --api_key_env GOOGLE_API_KEY \
-  --select "1,3-5,12" \
-  --chunk_size 1200 --chunk_overlap 200 \
-  --limit_docs 10
+  --select "1-3" \
+  --chunk_size 1200 --chunk_overlap 200
 ```
 
-📌 **ポイント**
-
-* `.jsonl` と `.jsonl.gz` の両方に対応
-* `--select` 形式： `"1,3-5,12"` → 1,3,4,5,12 を処理
-* 既存のインデックスは再生成されます（再構築仕様）
-
-出力例：
-
-```
-rag_index/
-├─ faiss.index
-├─ vectors.npy
-├─ docstore.jsonl
-├─ manifest.json
-└─ fields_used.json
-```
-
----
-
-## 🚀 4. 一括検索＋評価（batch_search_score.py）
-
-`batch_search_score.py` がこのリポジトリのメインスクリプトです。
-
-### 🔍 クエリ生成の正確な仕様
-
-> **検索クエリは、`data/result_i.jsonl(.gz)` に含まれる出願本文から直接生成されます。**
-> 各出願の `"title"`, `"abstract"`, `"description"`, `"claims"` を結合し、
-> それをクエリとして使用します。
-> `rag_index` 内のデータは検索対象であり、クエリ生成には使用しません。
-
----
-
-### 4.1 OpenAI互換APIで実行
+### 一括検索＋評価
 
 ```bash
 python batch_search_score.py \
   --data_dir ./data \
-  --select "1,3-5,12" \
-  --limit_docs 0 \
   --index_dir ./rag_index \
-  --truth ./data/CSV1.csv ./data/CSV2.csv \
-  --k 50 --mMax 10 --P 0.8 \
-  --provider openai_compat \
-  --api_base https://api.example.com/v1 \
-  --api_key_env EMB_API_KEY \
-  --emb_model embedding-japanese-v1
-```
-
----
-
-### 4.2 Geminiで実行
-
-```bash
-python batch_search_score.py \
-  --data_dir ./data \
-  --select "1-18" \
-  --limit_docs 0 \
-  --index_dir ./rag_index \
+  --select "4" \
   --truth ./data/CSV1.csv ./data/CSV2.csv \
   --k 50 --mMax 10 --P 0.8 \
   --provider gemini \
-  --api_key_env GOOGLE_API_KEY \
-  --emb_model models/embedding-001
-```
-
----
-
-### ⚖️ 主な引数（評価設定）
-
-| 引数             | 意味                           |
-| -------------- | ---------------------------- |
-| `--select`     | 使用する出願ファイル番号 (`"1,3-5,12"`)  |
-| `--k`          | 上位 K 件を評価に使用                 |
-| `--mMax`       | AY 最大ヒット件数（上限）               |
-| `--P`          | AX/AY の重み係数（0.0〜1.0）         |
-| `--limit_docs` | クエリ件数上限（0=全件）                |
-| `--index_dir`  | 検索対象インデックス（`rag_index`）      |
-| `--truth`      | 公式CSV（CSV1/CSV2）             |
-| `--provider`   | `openai_compat` または `gemini` |
-
----
-
-## 📊 5. 出力内容
-
-`batch_search_score.py` 実行後、自動で以下のファイルが生成されます。
-
-```
-score_results/
-├─ summary.csv                  # 出願ごとのスコア集計
-├─ JP2012239158A_result.json    # 個別評価（AX/AY命中詳細など）
-├─ JP2022123456A_result.json
-└─ ...
-retrieved_pairs.csv             # 検索結果の (query_id, knowledge_id) ペア
-```
-
-| ファイル                  | 内容                                                     |
-| --------------------- | ------------------------------------------------------ |
-| `summary.csv`         | 各出願の `ax_hit`, `ay_hit`, `score_raw`, `score_scaled` 等 |
-| `_result.json`        | 個票：ヒット順位、スコア内訳、対象文献情報                                  |
-| `retrieved_pairs.csv` | クエリ ↔ 類似文献ペアの生データ                                      |
-
----
-
-## 🔄 6. 一連の推奨フロー
-
-| 手順       | コマンド例                       | 説明            |
-| -------- | --------------------------- | ------------- |
-| 🏗️ 索引構築 | `build_index.py`            | 1回だけ実行すればOK   |
-| 🚀 一括評価  | `batch_search_score.py`     | 出願群をまとめて検索＋採点 |
-| 📈 分析    | `score_results/summary.csv` | スコア分布・順位分析に活用 |
-
-💡 個別デバッグが必要な場合のみ `search.py` / `score_explore.py` を使用。
-
----
-
-## 🧠 7. 評価ロジック概要
-
-* **AXヒット（同カテゴリ内一致）**：主要スコア要素
-* **AYヒット（関連出願群内一致）**：部分加点要素
-* **mMax / P** パラメータで、上限件数と寄与比を調整
-* スコアは `score_raw` → `score_scaled` に正規化して保存
-
----
-
-## 🩺 8. トラブルシューティング
-
-| 症状                      | 原因・対策                                                     |
-| ----------------------- | --------------------------------------------------------- |
-| ❌ `no valid docs found` | `--select` の指定番号が存在しない。 `"1,3-5"` のように確認                  |
-| ⚠️ `API error 401/429`  | APIキー設定またはレート上限。`--rpm`を下げて再試行                            |
-| 🈳 スコアが0ばかり             | 評価CSVの `syutugan` と `result_i` 内の出願番号表記を統一                |
-| 🧩 索引が空                 | `build_index.py` の `fields_used.json` を確認し、text抽出項目を再チェック |
-
----
-
-## 💡 9. クイックスタート（最短実行例）
-
-### OpenAI互換API 版
-
-```bash
-# 1) セットアップ
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-export EMB_API_KEY="YOUR_KEY"
-
-# 2) 索引作成
-python build_index.py \
-  --data_dir ./data --out_dir ./rag_index \
-  --provider openai_compat \
-  --api_base https://api.example.com/v1 \
-  --emb_model embedding-japanese-v1 \
-  --api_key_env EMB_API_KEY \
-  --select "1,2" \
-  --limit_docs 10
-
-# 3) 一括検索＋評価
-python batch_search_score.py \
-  --data_dir ./data \
-  --select "1,2" \
-  --index_dir ./rag_index \
-  --truth ./data/CSV1.csv ./data/CSV2.csv \
-  --k 50 --mMax 10 --P 0.8 \
-  --provider openai_compat \
-  --api_base https://api.example.com/v1 \
-  --api_key_env EMB_API_KEY \
-  --emb_model embedding-japanese-v1 \
-  --limit_docs 10
-```
-
-### Gemini 版
-
-```bash
-export GOOGLE_API_KEY="YOUR_KEY"
-python build_index.py \
-  --data_dir ./data --out_dir ./rag_index \
-  --provider gemini --emb_model models/embedding-001 \
-  --api_key_env GOOGLE_API_KEY \
-  --limit_docs 10
-python batch_search_score.py \
-  --data_dir ./data --select "1-18" \
-  --index_dir ./rag_index \
-  --truth ./data/CSV1.csv ./data/CSV2.csv \
-  --provider gemini --api_key_env GOOGLE_API_KEY \
   --emb_model models/embedding-001 \
-  --limit_docs 10
+  --api_key_env GOOGLE_API_KEY
 ```
 
 ---
 
-## 🧾 10. 開発メモ
+## 🧮 5. 内部の数理的対応関係
 
-* **FAISS**：`IndexFlatIP`（Cosine相当）を使用。`--use_gpu_faiss` でGPU転送可。
-* **ベクトル正規化**：L2正規化して登録。
-* **再現性**：乱数種 `--seed`（既定42）固定。
-* **ログ出力**：全主要処理で標準出力に進行表示（tqdm＋INFOログ）。
-* **出力ディレクトリ**：`score_results/` 以下にすべて保存されるため、結果が失われません。
-
----
-
-## 🧭 11. よくある質問（FAQ）
-
-| 質問                     | 回答                                                       |
-| ---------------------- | -------------------------------------------------------- |
-| Q. `--select` の指定方法は？  | `"1,3-5,12"` のようにカンマ区切り＋範囲指定可能。                          |
-| Q. 公式CSVが文字化けします。      | UTF-8 / CP932 自動判定で読込み。列名の欠落に注意。                         |
-| Q. 評価は親文献単位？           | はい。チャンクを親IDで集約後、上位K件で評価。                                 |
-| Q. batchでGeminiを使うと遅い？ | Geminiは一括APIが無いため、内部で逐次呼び出しを行います。`--rpm`/`--batch`で調整可能。 |
+| 項目            | 処理         | 数理的意味        |
+| ------------- | ---------- | ------------ |
+| L2正規化         | 各ベクトルを単位長に | コサイン距離＝内積    |
+| IndexFlatIP   | 内積ベースFAISS | 余弦類似度検索      |
+| チャンク分割        | 文書の局所特徴保持  | 長文内の部分意味単位   |
+| 平均ベクトル        | 部分埋め込みの集約  | センテンスプーリング   |
+| parent_id重複除去 | 1文献＝1スコア代表 | 出願単位のランキング評価 |
 
 ---
 
-### 🏁 総括
+## ✅ 6. まとめ（処理全体の流れ）
 
-> * `build_index.py`：検索対象（FAISSインデックス）を作成
-> * `batch_search_score.py`：本文クエリを用いた一括検索＋AX/AY評価
-> * `score_results/`：結果はすべて保存・可視化可能
+```
+[既存文献]
+  └─ build_index.py
+       ├─ title+abstract+description+claims を連結
+       ├─ 文字単位チャンク化（overlap付き）
+       ├─ 各チャンクを埋め込み → 正規化
+       ├─ FAISS(IndexFlatIP) に登録
+       └─ rag_index/ に保存
 
-この2ステップのみで、GENIAC PRIZE 形式の検索・評価実験が完結します。
-（`search.py` と `score_explore.py` は内部処理の分離版として残されています）
+[クエリ文献]
+  └─ batch_search_score.py
+       ├─ 同様に連結＆分割 → 埋め込み平均化
+       ├─ FAISSで全チャンクと類似度検索
+       ├─ 同一parent_idは最上位のみ残す
+       ├─ 上位mMax件で評価
+       └─ summary.csv / overall_summary.txt 出力
+```
 
 ---
+
+この README は、
+`build_index.py` と `batch_search_score.py` の **実際のコード仕様に100%一致した技術ドキュメント** です。
+これ1本で埋め込み・チャンク分割・FAISS検索・評価の全挙動が再現可能です。
