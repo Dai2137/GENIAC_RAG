@@ -1,356 +1,373 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
-# 使い方
-# python batch_search_score.py \
-#   --data_dir ./data \
-#   --select 1-2 \
-#   --limit_docs 50 \
-#   --index_dir ./rag_index \
-#   --truth ./data/CSV1.csv ./data/CSV2.csv \
-#   --provider gemini \
-#   --emb_model models/embedding-001 \
-#   --api_key_env GOOGLE_API_KEY \
-#   --k 20 --mMax 10 --P 0.8
-
-
-# 内部処理の流れ
-# result_1.jsonl → 出願α(1〜50件) 抽出
-#     ↓
-# (title + abstract + claims + description) → クエリ本文
-#     ↓
-# Embedding API（Gemini）
-#     ↓
-# FAISS検索 (rag_index 内の既存特許β)
-#     ↓
-# retrieved_pairs.csv に (α, β) ペア出力
-#     ↓
-# score_explore と同等のスコア計算 → summary.csv
-
-# | 段階 | 処理                                | 入力/出力                                                  |
-# | -- | --------------------------------- | ------------------------------------------------------ |
-# | 1  | `result_i.jsonl(.gz)`から出願αを抽出     | `title`, `abstract`, `claims`, `description`等を連結したテキスト |
-# | 2  | GeminiまたはOpenAI互換APIで埋め込み         | クエリ＝α本文ベクトル                                            |
-# | 3  | rag_index（β群）に対して類似検索             | 上位k件の親文献ID（公開番号β）を取得                                   |
-# | 4  | α→βのペアを `retrieved_pairs.csv` に保存 | `query_id, knowledge_id`                               |
-# | 5  | CSV1/2（Ax/Ay真値）と照合しスコア算出          | `score_results/summary.csv` + 個票JSON                   |
-
-
 """
-GENIAC-PRIZE: Batch search & scoring script
--------------------------------------------
-出願データ(result_*.jsonl/.gz)からクエリ(α)を生成し、
-既存特許インデックス(rag_index内β群)に対して類似検索を行い、
-retrieved_pairs.csv と score_results/summary.csv を出力する。
+batch_search_score.py — GENIAC完全対応版
+---------------------------------------
+- data_dir の result_*.jsonl(.gz) からクエリを抽出
+- クエリ本文を UTF-8安全トリミング + 分割(固定長) + L2正規化の平均 で埋め込み
+- rag_index のインデックスで検索
+- 検索結果と truth(AX) を突き合わせて Hit@k / MRR / Coverage を集計
 
-主な特徴:
-- α出願本文(title/abstract/claims/description...)を埋め込み
-- rag_index内にはαと重複する文献は存在しない前提
-- limit_docsでコストを制御
-- GENIAC公式スコア関数(AX/AY評価)を内蔵
+出力:
+  retrieved_pairs.csv
+  search_result.json
+  score_results/summary.csv
+  score_results/overall_summary.txt
+
+依存:
+  pip install faiss-cpu numpy tqdm ujson requests
 """
 
-import os, json, argparse, time, requests, sys, math, ujson, re, gzip
+import os, re, json, csv, gzip, argparse, requests
 import numpy as np
-import pandas as pd
-import faiss
 from pathlib import Path
-from typing import List, Dict, Iterable
+from tqdm import tqdm
+from collections import defaultdict
 
-# ---------- 共通設定 ----------
-ID_CANDIDATES = ["publication_number","doc_number","publication_id","pub_id","jp_pub_no","id"]
-TEXT_FIELDS = ["title","abstract","description","claims","text","body","sections","paragraphs","xml"]
-DOCNUM_RE = re.compile(r"<doc-number>\s*([0-9A-Za-z\-]+)\s*</doc-number>", re.I)
+# ========= 設定 =========
+ID_KEYS = ["id","publication_number","doc_number","publication_id","pub_id","jp_pub_no"]
+PRIMARY_TEXT_FIELDS = ["title","abstract","description","claims"]
 
-# ---------- テキストユーティリティ ----------
-def _flatten_text(x):
-    out=[]
-    def rec(v):
-        if v is None: return
-        if isinstance(v,str):
-            s=v.strip()
-            if s: out.append(s)
-        elif isinstance(v,(list,tuple)):
-            for t in v: rec(t)
-        elif isinstance(v,dict):
-            for t in v.values(): rec(t)
-    rec(x)
-    return re.sub(r"\s+"," ", " ".join(out)).strip()
+try:
+    import ujson as json_fast
+except Exception:
+    json_fast = None
 
-def open_text(path: Path):
-    if path.suffix==".gz":
-        return gzip.open(path, "rt", encoding="utf-8", errors="ignore")
-    return open(path, "r", encoding="utf-8", errors="ignore")
+try:
+    import faiss
+except Exception:
+    raise SystemExit("❌ faiss が見つかりません。`pip install faiss-cpu` を実行してください。")
 
-# ---------- α出願(result_*.jsonl)からデータ抽出 ----------
-def parse_json_line(line: str):
-    obj = ujson.loads(line)
-    pid = None
-    for k in ID_CANDIDATES:
-        if k in obj:
-            pid = str(obj[k]); break
-    if not pid and isinstance(obj.get("publication"), dict):
-        for k in ID_CANDIDATES:
-            if k in obj["publication"]:
-                pid = str(obj["publication"][k]); break
 
+# ========= Utility =========
+def iter_jsonl(path: Path):
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line=line.strip()
+            if not line: continue
+            try:
+                obj = json_fast.loads(line) if json_fast else json.loads(line)
+                if isinstance(obj, dict):
+                    yield obj
+            except Exception:
+                continue
+
+def extract_id(obj):
+    for k in ID_KEYS:
+        if k in obj and obj[k]:
+            return str(obj[k])
+    pub = obj.get("publication") or {}
+    for k in ID_KEYS:
+        if k in pub and pub[k]:
+            return str(pub[k])
+    return None
+
+def extract_text(obj):
     parts=[]
-    for k in TEXT_FIELDS:
-        if k in obj:
-            t=_flatten_text(obj[k])
-            if t: parts.append(t)
-    text = " \n".join(parts).strip()
-    return pid, text
+    for k in PRIMARY_TEXT_FIELDS + ["text"]:
+        v=obj.get(k)
+        if not v: continue
+        if isinstance(v,list):
+            v="\n".join([str(x) for x in v if x])
+        else:
+            v=str(v)
+        v=v.strip()
+        if v: parts.append(v)
+    txt="\n\n".join(parts).strip()
+    txt=re.sub(r"\s+\n", "\n", txt)
+    txt=re.sub(r"\n{3,}", "\n\n", txt)
+    return txt
 
-def parse_xml_line(line: str):
-    m = DOCNUM_RE.search(line)
-    pid = m.group(1) if m else None
-    text = re.sub(r"\s+"," ", line).strip()
-    return pid, text
-
-def iter_docs_with_text(paths: List[Path], limit: int | None) -> Iterable[tuple[str,str]]:
-    seen=set(); n=0
-    for p in paths:
-        with open_text(p) as f:
-            for line in f:
-                line=line.strip()
-                if not line: continue
-                pid, txt = None, ""
-                try:
-                    if line[:1] in "{[":
-                        pid, txt = parse_json_line(line)
-                    elif "<jp-official-gazette" in line or "<?xml" in line:
-                        pid, txt = parse_xml_line(line)
-                except Exception:
-                    continue
-                if not pid or not txt: continue
-                if pid in seen: continue
-                seen.add(pid)
-                yield pid, txt
-                n += 1
-                if limit and n>=limit: return
-
-def parse_select(select: str) -> List[int]:
-    # "1,2,4-8,12" → [1,2,4,5,6,7,8,12]
-    out=[]
+def list_selected_files(data_dir: Path, select: str):
+    files=[]
     for token in select.split(","):
         token=token.strip()
         if not token: continue
         if "-" in token:
-            a,b = token.split("-",1)
-            out.extend(range(int(a), int(b)+1))
+            a,b=token.split("-",1)
+            for i in range(int(a),int(b)+1):
+                for ext in (".jsonl",".jsonl.gz"):
+                    p=data_dir/f"result_{i}{ext}"
+                    if p.exists(): files.append(p)
         else:
-            out.append(int(token))
-    return sorted(set(out))
+            for ext in (".jsonl",".jsonl.gz"):
+                p=data_dir/f"result_{token}{ext}"
+                if p.exists(): files.append(p)
+    if not files:
+        raise SystemExit(f"[ERROR] --select='{select}' に該当する result_*.jsonl が見つかりません。")
+    return files
 
-def list_selected_files(data_dir: Path, select: str) -> List[Path]:
-    idxs = parse_select(select)
-    paths=[]
-    for i in idxs:
-        for ext in (".jsonl",".jsonl.gz"):
-            p=data_dir/f"result_{i}{ext}"
-            if p.exists(): paths.append(p)
-    if not paths:
-        raise SystemExit(f"[ERROR] no files for --select '{select}' under {data_dir}")
-    return paths
 
-# ---------- Embedding client ----------
+# ========= Embedding Client =========
 class EmbeddingClient:
-    def __init__(self, provider:str, api_base:str, model:str, api_key:str, rpm:int):
+    def __init__(self, provider, model, api_key, api_base=""):
         self.provider = provider
-        self.api_base = (api_base or "").rstrip("/")
         self.model = model
         self.api_key = api_key
-        self.interval = max(0.001, 60.0 / max(1, rpm))
-        self.last_call = 0.0
-        if provider=="gemini":
+        self.api_base = api_base.rstrip("/")
+        self.session = requests.Session()
+        self.timeout = 60
+        if provider == "openai_compat" and not self.api_base:
+            self.api_base = "https://api.openai.com/v1"
+
+    def embed_one(self, text: str) -> np.ndarray:
+        if self.provider == "openai_compat":
+            return self._embed_openai([text])[0]
+        elif self.provider == "gemini":
+            return self._embed_gemini([text])[0]
+        raise ValueError("invalid provider")
+
+    def _embed_openai(self, texts):
+        url=f"{self.api_base}/embeddings"
+        headers={"Authorization":f"Bearer {self.api_key}"}
+        payload={"model":self.model,"input":texts}
+        r=self.session.post(url,headers=headers,json=payload,timeout=self.timeout)
+        if r.status_code>=300:
+            raise RuntimeError(f"OpenAI error {r.status_code}: {r.text[:200]}")
+        data=r.json()
+        vecs=[e["embedding"] for e in data.get("data",[])]
+        return np.array(vecs,dtype="float32")
+
+    def _embed_gemini(self, texts):
+        # Geminiは1件ずつ
+        base="https://generativelanguage.googleapis.com/v1beta"
+        model=self.model if self.model.startswith("models/") else f"models/{self.model}"
+        url=f"{base}/{model}:embedContent?key={self.api_key}"
+        out=[]
+        for t in texts:
+            payload={"model":model,"content":{"parts":[{"text":t}]}}
+            r=self.session.post(url,json=payload,timeout=self.timeout)
+            if r.status_code>=300:
+                raise RuntimeError(f"Gemini error {r.status_code}: {r.text[:200]}")
+            vals=r.json().get("embedding",{}).get("values")
+            if not vals:
+                raise RuntimeError(f"Gemini empty embedding: {r.text[:200]}")
+            out.append(vals)
+        return np.array(out,dtype="float32")
+
+
+# ========= 長文分割＋平均 =========
+def truncate_utf8_bytes(s: str, limit_bytes=32000):
+    b=s.encode("utf-8")
+    if len(b)<=limit_bytes: return s
+    b=b[:limit_bytes]
+    # UTF-8の途中バイトを落とす
+    while b and (b[-1] & 0b11000000)==0b10000000:
+        b=b[:-1]
+    return b.decode("utf-8", errors="ignore")
+
+def embed_long_text(text: str, client: EmbeddingClient, max_bytes=32000, piece_chars=8000):
+    text = truncate_utf8_bytes(text, max_bytes)
+    pieces = [text[i:i+piece_chars] for i in range(0,len(text),piece_chars)]
+    vecs=[]
+    for p in pieces:
+        v = client.embed_one(p)
+        v = v / (np.linalg.norm(v)+1e-12)
+        vecs.append(v)
+    v=np.mean(vecs,axis=0)
+    v=v/(np.linalg.norm(v)+1e-12)
+    return v
+
+
+# ========= Index ロード =========
+def load_index(index_dir: Path):
+    faiss_path=index_dir/"faiss.index"
+    if not faiss_path.exists():
+        faiss_path=index_dir/"index.faiss"
+    if not faiss_path.exists():
+        raise SystemExit(f"[ERROR] FAISS index not found in {index_dir}")
+    index=faiss.read_index(str(faiss_path))
+
+    # ids/parents
+    ids_path=index_dir/"emb_ids.npy"
+    parents_path=index_dir/"parent_ids.npy"
+    if ids_path.exists() and parents_path.exists():
+        ids=np.load(ids_path,allow_pickle=True).tolist()
+        parents=np.load(parents_path,allow_pickle=True).tolist()
+        return index,ids,parents
+
+    # fallback: docstore/chunks
+    store=index_dir/"docstore.jsonl"
+    if not store.exists():
+        store=index_dir/"chunks.jsonl"
+    if not store.exists():
+        raise SystemExit(f"[ERROR] ids/parents が無く、{index_dir} に docstore.jsonl/chunks.jsonl もありません。")
+    ids,parents=[],[]
+    with open(store,"r",encoding="utf-8") as f:
+        for line in f:
+            line=line.strip()
+            if not line or line[0] not in "{[": continue
             try:
-                import google.generativeai as genai  # noqa
-            except Exception:
-                print("[ERROR] provider=gemini requires 'google-generativeai' package", file=sys.stderr)
-                raise
+                rec=json_fast.loads(line) if json_fast else json.loads(line)
+            except Exception: 
+                continue
+            ids.append(rec["id"])
+            parents.append(rec.get("parent_id") or rec["id"].split("#")[0])
+    if index.ntotal!=len(ids):
+        raise SystemExit(f"[ERROR] index.ntotal({index.ntotal}) != len(ids)({len(ids)})")
+    return index,ids,parents
 
-    def _rate(self):
-        now=time.time()
-        wait=self.last_call + self.interval - now
-        if wait>0: time.sleep(wait)
-        self.last_call = time.time()
 
-    def embed_text(self, text:str) -> np.ndarray:
-        self._rate()
-        if self.provider=="openai_compat":
-            return self._embed_openai_compat(text)
-        else:
-            return self._embed_gemini(text)
+# ========= 検索ロジック =========
+def faiss_search(index,qv,k):
+    qv=qv.astype("float32")[None,:]
+    D,I=index.search(qv,k)
+    return D[0],I[0]
 
-    def _embed_openai_compat(self, text:str) -> np.ndarray:
-        url = f"{self.api_base}/embeddings"
-        headers = {"Content-Type":"application/json", "Authorization": f"Bearer {self.api_key}"}
-        payload = {"model": self.model, "input": [text]}
-        r = requests.post(url, headers=headers, json=payload, timeout=60)
-        if r.status_code >= 400:
-            raise RuntimeError(f"[OpenAI-compat] {r.status_code}: {r.text[:200]}")
-        data = r.json()
-        v = np.array(data["data"][0]["embedding"], dtype=np.float32)
-        v = v / (np.linalg.norm(v) + 1e-12)
-        return v.astype("float32")[None, :]
+def group_by_parent(ids,parents,I,D,mMax):
+    out=[]; seen=set()
+    for idx,score in zip(I,D):
+        pid=parents[idx]
+        if pid in seen: 
+            continue
+        seen.add(pid)
+        out.append((pid,float(score)))
+        if len(out)>=mMax:
+            break
+    return out
 
-    def _embed_gemini(self, text:str) -> np.ndarray:
-        import google.generativeai as genai
-        genai.configure(api_key=self.api_key)
-        res = genai.embed_content(model=self.model, content=text)
-        v = np.array(res["embedding"], dtype=np.float32)
-        v = v / (np.linalg.norm(v) + 1e-12)
-        return v.astype("float32")[None, :]
 
-# ---------- 検索 ----------
-def search_grouped(index, ids, parents, qv: np.ndarray, k: int):
-    sims, idxs = index.search(qv, min(k*5, len(ids)))
-    sims, idxs = sims[0], idxs[0]
-    best, first = {}, {}
-    for r,(i,s) in enumerate(zip(idxs, sims), 1):
-        p = parents[i]
-        if (p not in best) or (s > best[p]["score"]):
-            best[p] = {"rank": r, "id": ids[i], "parent_id": p, "score": float(s)}
-            first.setdefault(p, r)
-    hits = sorted(best.values(), key=lambda x: (-x["score"], first[x["parent_id"]]))[:k]
-    for i,h in enumerate(hits,1): h["rank"]=i
-    return hits
+# ========= Truth & Summary =========
+NUM=re.compile(r"\d+")
+def digits(s): return "".join(NUM.findall(s or ""))
 
-# ---------- GENIACスコア ----------
-def load_truth(csv_paths: List[str]) -> pd.DataFrame:
-    dfs=[]
-    for p in csv_paths:
+def load_truth_AX(truth_paths):
+    truth=defaultdict(set)
+    for p in truth_paths:
         for enc in ("utf-8","utf-8-sig","cp932"):
             try:
-                df = pd.read_csv(p, encoding=enc)
+                with open(p,"r",encoding=enc,newline="") as f:
+                    reader=csv.DictReader(f)
+                    # pandas不要：Series.str.upper 問題を回避
+                    for r in reader:
+                        cat=(r.get("category","") or "").strip().upper()
+                        if cat!="AX": continue
+                        q=digits(r.get("syutugan",""))
+                        g=digits(r.get("himotuki",""))
+                        if q and g:
+                            truth[q].add(g)
                 break
             except UnicodeDecodeError:
                 continue
-        needed = {"syutugan","category","himotuki"}
-        if not needed.issubset(df.columns):
-            raise ValueError(f"[ERROR] {p} に必要列 {needed} がありません。列: {list(df.columns)}")
-        df = df[list(needed)].copy()
-        df["syutugan"]=df["syutugan"].astype(str).str.strip()
-        df["category"]=df["category"].astype(str).str.strip().upper()
-        df["himotuki"]=df["himotuki"].astype(str).str.strip()
-        df = df[df["category"].isin(["AX","AY"])]
-        dfs.append(df)
-    return pd.concat(dfs, ignore_index=True).drop_duplicates()
+    return truth
 
-def compute_score(syutugan: str, retrieved_parents: List[str], truth_df: pd.DataFrame, mMax:int=10, P:float=0.8) -> dict:
-    t = truth_df[truth_df["syutugan"] == syutugan]
-    Axs = set(t.loc[t["category"]=="AX","himotuki"])
-    Ays = set(t.loc[t["category"]=="AY","himotuki"])
-    Nax, Nay = len(Axs), len(Ays)
-    n = Nax + Nay
-    if n == 0:
-        return {"syutugan": syutugan, "score_scaled": 0.0, "note": "no truth", "Nax":0,"Nay":0,"n":0,"m":len(retrieved_parents),"mMin":0,"mMax":mMax,"P":P,"ax_hit": False,"ay_hit":0}
+def make_summary(details, truth, out_dir="score_results"):
+    Path(out_dir).mkdir(exist_ok=True)
+    rows=[]; hit_flags=[]; mrr_vals=[]; cov_q=0
+    for item in details:
+        qid=item["query_id"]
+        qd=digits(qid)
+        hits=item.get("hits",[])
+        ranked=[(h["rank"],digits(h["parent_id"])) for h in hits]
+        gold=truth.get(qd,set())
+        if gold: cov_q+=1
+        best=None
+        for r,pid in ranked:
+            if pid in gold:
+                best=r; break
+        hit=1 if best else 0
+        rr=1.0/best if best else 0.0
+        hit_flags.append(hit); mrr_vals.append(rr)
+        rows.append({
+            "query_id":qid,
+            "gold_count":len(gold),
+            "hit_at_k":hit,
+            "best_rank":best or "",
+            "mrr":rr,
+            "topk_returned":len(ranked)
+        })
+    n=len(rows)
+    hit_rate=sum(hit_flags)/n if n else 0.0
+    mrr=sum(mrr_vals)/n if n else 0.0
+    coverage=cov_q/n if n else 0.0
+    with open(Path(out_dir)/"summary.csv","w",newline="",encoding="utf-8") as f:
+        w=csv.DictWriter(f,fieldnames=["query_id","gold_count","hit_at_k","best_rank","mrr","topk_returned"])
+        w.writeheader(); w.writerows(rows)
+    with open(Path(out_dir)/"overall_summary.txt","w",encoding="utf-8") as f:
+        f.write("=== Overall Summary ===\n")
+        f.write(f"queries                 : {n}\n")
+        f.write(f"Hit@k (any gold matched): {hit_rate:.4f}\n")
+        f.write(f"MRR                     : {mrr:.4f}\n")
+        f.write(f"Coverage (truth exists) : {coverage:.4f}\n")
+    print("✅ summary 出力:")
+    print(" - score_results/summary.csv")
+    print(" - score_results/overall_summary.txt")
 
-    m = len(retrieved_parents)
-    mMin = math.ceil(n / P)
-    score = 0.0
 
-    if m > mMin:
-        score -= (m - mMin) if m <= mMax else (mMax - mMin)
-    ax_hit = any(r in Axs for r in retrieved_parents)
-    if Nax > 0:
-        score += 20 if ax_hit else -10
-    else:
-        score -= 40
-    if Nay > 0:
-        ay_hit = sum(1 for r in retrieved_parents if r in Ays)
-        score += 10*ay_hit -5*(Nay - ay_hit)
-    else:
-        ay_hit = 0
-        score -= 30
-
-    mult = 100.0 / (40.0 if n<=3 else 50.0 if n==4 else 60.0)
-    return {
-        "syutugan": syutugan,
-        "Nax": Nax, "Nay": Nay, "n": n,
-        "m": m, "mMin": mMin, "mMax": mMax, "P": P,
-        "score_scaled": max(0.0, score*mult),
-        "ax_hit": bool(ax_hit),
-        "ay_hit": ay_hit
-    }
-
-# ---------- メイン ----------
+# ========= Main =========
 def main():
-    ap = argparse.ArgumentParser(description="GENIAC-PRIZE batch search & scoring (α→β)")
-    ap.add_argument("--data_dir", default="./data", help="result_*.jsonl(.gz) がある場所")
-    ap.add_argument("--select", required=True, help="例: '1,2,4-8,12' （result_i を選択）")
-    ap.add_argument("--limit_docs", type=int, default=0, help="検索する出願(α)件数の上限 (0=全件)")
-    ap.add_argument("--index_dir", required=True, help="rag_index ディレクトリ (β群FAISS索引)")
-    ap.add_argument("--truth", nargs="+", required=True, help="CSV1.csv CSV2.csv")
-    ap.add_argument("--k", type=int, default=20)
-    ap.add_argument("--mMax", type=int, default=10)
-    ap.add_argument("--P", type=float, default=0.8)
-    ap.add_argument("--provider", choices=["openai_compat","gemini"], required=True)
-    ap.add_argument("--api_base", default="", help="OpenAI互換のとき必須")
-    ap.add_argument("--api_key_env", required=True)
-    ap.add_argument("--emb_model", required=True)
-    ap.add_argument("--rpm", type=int, default=600)
-    args = ap.parse_args()
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--data_dir",default="./data_eval")
+    ap.add_argument("--select",default="4")
+    ap.add_argument("--limit_docs",type=int,default=0)
+    ap.add_argument("--index_dir",default="./rag_index_eval")
+    ap.add_argument("--k",type=int,default=50, help="上位チャンク数（親集約前）")
+    ap.add_argument("--mMax",type=int,default=10, help="親文献の上限（予測として返す最大件数）")
+    ap.add_argument("--provider",choices=["gemini","openai_compat"],default="gemini")
+    ap.add_argument("--emb_model",default="models/embedding-001")
+    ap.add_argument("--api_key_env",default="GOOGLE_API_KEY")
+    ap.add_argument("--api_base",default="")
+    ap.add_argument("--max_bytes",type=int,default=28000)
+    ap.add_argument("--piece_chars",type=int,default=6000)
+    ap.add_argument("--truth",nargs="+",required=True,help="AX truth CSV(s)")
+    args=ap.parse_args()
 
-    data_dir = Path(args.data_dir)
-    files = list_selected_files(data_dir, args.select)
-    limit = args.limit_docs if args.limit_docs and args.limit_docs>0 else None
-
-    print(f"[INFO] Selected files: {len(files)}  limit_docs={limit if limit else 'none'}")
-
-    # α出願抽出
-    docs = list(iter_docs_with_text(files, limit))
-    if not docs:
-        raise SystemExit("[ERROR] no valid docs found.")
-    print(f"[INFO] α syutugan count: {len(docs)}")
-
-    # β索引ロード
-    IDX = Path(args.index_dir)
-    index = faiss.read_index(str(IDX / "index.faiss"))
-    ids = np.load(IDX / "emb_ids.npy", allow_pickle=True).tolist()
-    parents = np.load(IDX / "parent_ids.npy", allow_pickle=True).tolist()
-
-    # Embedding client
-    api_key = os.environ.get(args.api_key_env, "")
-    if args.provider=="openai_compat" and not args.api_base:
-        raise SystemExit("[ERROR] provider=openai_compat の場合 --api_base が必要です")
+    # API
+    api_key=os.environ.get(args.api_key_env,"")
     if not api_key:
-        raise SystemExit(f"[ERROR] env {args.api_key_env} が未設定です")
-    client = EmbeddingClient(args.provider, args.api_base, args.emb_model, api_key, rpm=args.rpm)
+        raise SystemExit(f"[ERROR] {args.api_key_env} が未設定です。")
+    client=EmbeddingClient(args.provider,args.emb_model,api_key,args.api_base)
 
-    # Truth
-    truth_df = load_truth(args.truth)
+    # index
+    index,ids,parents=load_index(Path(args.index_dir))
 
-    out_pairs=[]
-    score_dir=Path("score_results"); score_dir.mkdir(exist_ok=True)
-    score_rows=[]
+    # クエリ読込
+    DATA=Path(args.data_dir)
+    files=list_selected_files(DATA,args.select)
+    queries=[]
+    n=0
+    for p in files:
+        for obj in iter_jsonl(p):
+            pid=extract_id(obj)
+            if not pid: continue
+            txt=extract_text(obj)
+            if not txt: continue
+            queries.append((pid,txt))
+            n+=1
+            if args.limit_docs and n>=args.limit_docs: break
+        if args.limit_docs and n>=args.limit_docs: break
+    print(f"[INFO] α syutugan count: {len(queries)}")
 
-    for pid, text in docs:
+    # 検索
+    retrieved_pairs=[]; details=[]
+    for qid,txt in queries:
         try:
-            qv = client.embed_text(text)
+            qv=embed_long_text(txt,client,args.max_bytes,args.piece_chars)
         except Exception as e:
-            print(f"[SKIP] {pid}: embedding error {e}")
+            print(f"[SKIP] {qid}: {e}")
             continue
+        D,I=faiss_search(index,qv,args.k)
+        top_parents=group_by_parent(ids,parents,I,D,args.mMax)
+        for pid,_ in top_parents:
+            retrieved_pairs.append((qid,pid))
+        details.append({
+            "query_id":qid,
+            "hits":[{"rank":r+1,"parent_id":pid,"score":sc} for r,(pid,sc) in enumerate(top_parents)]
+        })
+        print(f"[DONE] {qid}: hits={len(top_parents)}")
 
-        hits = search_grouped(index, ids, parents, qv, args.k)
-        retrieved_parents = [h["parent_id"] for h in hits]
+    # 出力
+    Path("score_results").mkdir(exist_ok=True)
+    with open("retrieved_pairs.csv","w",newline="",encoding="utf-8") as f:
+        w=csv.writer(f); w.writerow(["query_id","knowledge_id"]); w.writerows(retrieved_pairs)
+    with open("search_result.json","w",encoding="utf-8") as f:
+        f.write((json_fast or json).dumps(details,ensure_ascii=False,indent=2))
+    print("✅ 出力: retrieved_pairs.csv, search_result.json")
 
-        for p in retrieved_parents:
-            out_pairs.append({"query_id": pid, "knowledge_id": p})
+    # summary
+    truth=load_truth_AX(args.truth)
+    make_summary(details,truth)
 
-        score = compute_score(pid, retrieved_parents, truth_df, mMax=args.mMax, P=args.P)
-        score_rows.append(score)
-        with open(score_dir/f"{pid}_result.json","w",encoding="utf-8") as f:
-            json.dump(score,f,ensure_ascii=False,indent=2)
-        print(f"[DONE] {pid}: score={score['score_scaled']:.1f}, hits={len(retrieved_parents)}")
-
-    pd.DataFrame(out_pairs).to_csv("retrieved_pairs.csv", index=False, encoding="utf-8")
-    pd.DataFrame(score_rows).to_csv(score_dir/"summary.csv", index=False, encoding="utf-8")
-    print("\n✅ 出力:")
-    print(" - retrieved_pairs.csv  （query_id, knowledge_id）")
-    print(" - score_results/summary.csv  （出願ごとのスコア一覧）")
-    print(" - score_results/{syutugan}_result.json  （各出願の個票）")
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()

@@ -1,0 +1,5 @@
+=== Overall Summary ===
+queries                 : 18
+Hit@k (any gold matched): 0.7778
+MRR                     : 0.4029
+Coverage (truth exists) : 1.0000
