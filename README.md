@@ -212,8 +212,8 @@ score_results/overall_summary.txt
 
 ```bash
 python build_index.py \
-  --data_dir ./data \
-  --out_dir ./rag_index \
+  --data_dir ./data_eval \
+  --out_dir ./rag_index_eval \
   --provider gemini \
   --emb_model models/embedding-001 \
   --api_key_env GOOGLE_API_KEY \
@@ -225,14 +225,15 @@ python build_index.py \
 
 ```bash
 python batch_search_score.py \
-  --data_dir ./data \
-  --index_dir ./rag_index \
+  --data_dir ./data_eval \
+  --index_dir ./rag_index_eval \
   --select "4" \
-  --truth ./data/CSV1.csv ./data/CSV2.csv \
+  --truth ./data_eval/eval_truth_AX.csv \
   --k 50 --mMax 10 --P 0.8 \
   --provider gemini \
   --emb_model models/embedding-001 \
   --api_key_env GOOGLE_API_KEY
+
 ```
 
 ---
