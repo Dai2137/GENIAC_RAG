@@ -252,47 +252,88 @@ def load_truth_AX(truth_paths):
                 continue
     return truth
 
-def make_summary(details, truth, out_dir="score_results"):
+def make_summary(details, truth, mMax, out_dir="score_results"):
+    from pathlib import Path
+    import csv, json
     Path(out_dir).mkdir(exist_ok=True)
+
     rows=[]; hit_flags=[]; mrr_vals=[]; cov_q=0
+    precisions=[]          # Precision@mMax（各クエリの）
+    gold_hits_counts=[]    # mMax 中の正解数（各クエリの）
+
+    def digits_only(s):
+        import re
+        return "".join(re.findall(r"\d+", s or ""))
+
     for item in details:
         qid=item["query_id"]
-        qd=digits(qid)
+        qd=digits_only(qid)
         hits=item.get("hits",[])
-        ranked=[(h["rank"],digits(h["parent_id"])) for h in hits]
-        gold=truth.get(qd,set())
-        if gold: cov_q+=1
+        # 返却上限（親）は既に mMax で切られている想定だが、念のため truncate
+        ranked=[(h["rank"], digits_only(h["parent_id"])) for h in hits][:mMax]
+
+        gold=truth.get(qd, set())
+        if gold: cov_q += 1
+
+        # best rank / Hit@k / MRR
         best=None
+        gold_hits=0
         for r,pid in ranked:
             if pid in gold:
-                best=r; break
+                gold_hits += 1
+                if best is None:
+                    best = r
         hit=1 if best else 0
-        rr=1.0/best if best else 0.0
-        hit_flags.append(hit); mrr_vals.append(rr)
+        rr = 1.0 / best if best else 0.0
+
+        # Precision@k（分母は実返却数≦mMax）
+        denom = max(1, len(ranked))
+        p_at_k = gold_hits / denom
+
+        hit_flags.append(hit)
+        mrr_vals.append(rr)
+        precisions.append(p_at_k)
+        gold_hits_counts.append(gold_hits)
+
         rows.append({
-            "query_id":qid,
-            "gold_count":len(gold),
-            "hit_at_k":hit,
-            "best_rank":best or "",
-            "mrr":rr,
-            "topk_returned":len(ranked)
+            "query_id": qid,
+            "gold_count": len(gold),
+            "hit_at_k": hit,
+            "best_rank": best or "",
+            "mrr": rr,
+            "topk_returned": len(ranked),
+            "gold_hits_in_mMax": gold_hits,      # ★追加：mMax中の正解数
+            "precision_at_mMax": round(p_at_k, 6)  # ★追加：正解率
         })
+
+    # 全体集計
     n=len(rows)
-    hit_rate=sum(hit_flags)/n if n else 0.0
-    mrr=sum(mrr_vals)/n if n else 0.0
-    coverage=cov_q/n if n else 0.0
+    hit_rate = (sum(hit_flags)/n) if n else 0.0
+    mrr      = (sum(mrr_vals)/n) if n else 0.0
+    coverage = (sum(1 for r in rows if r["gold_count"]>0)/n) if n else 0.0
+    avg_gold_hits = (sum(gold_hits_counts)/n) if n else 0.0
+    avg_precision = (sum(precisions)/n) if n else 0.0
+
+    # 保存
     with open(Path(out_dir)/"summary.csv","w",newline="",encoding="utf-8") as f:
-        w=csv.DictWriter(f,fieldnames=["query_id","gold_count","hit_at_k","best_rank","mrr","topk_returned"])
+        fieldnames = ["query_id","gold_count","hit_at_k","best_rank","mrr",
+                      "topk_returned","gold_hits_in_mMax","precision_at_mMax"]
+        w=csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader(); w.writerows(rows)
+
     with open(Path(out_dir)/"overall_summary.txt","w",encoding="utf-8") as f:
         f.write("=== Overall Summary ===\n")
         f.write(f"queries                 : {n}\n")
         f.write(f"Hit@k (any gold matched): {hit_rate:.4f}\n")
         f.write(f"MRR                     : {mrr:.4f}\n")
         f.write(f"Coverage (truth exists) : {coverage:.4f}\n")
+        f.write(f"Avg gold_hits_in_mMax   : {avg_gold_hits:.4f}\n")
+        f.write(f"Avg precision@{mMax:<5} : {avg_precision:.4f}\n")
+
     print("✅ summary 出力:")
-    print(" - score_results/summary.csv")
+    print(" - score_results/summary.csv （gold_hits_in_mMax, precision_at_mMax 付き）")
     print(" - score_results/overall_summary.txt")
+
 
 
 # ========= Main =========
@@ -367,7 +408,7 @@ def main():
 
     # summary
     truth=load_truth_AX(args.truth)
-    make_summary(details,truth)
+    make_summary(details,truth, args.mMax)
 
 if __name__=="__main__":
     main()

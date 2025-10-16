@@ -3,3 +3,5 @@ queries                 : 18
 Hit@k (any gold matched): 0.7778
 MRR                     : 0.4029
 Coverage (truth exists) : 1.0000
+Avg gold_hits_in_mMax   : 0.7778
+Avg precision@10    : 0.0778
