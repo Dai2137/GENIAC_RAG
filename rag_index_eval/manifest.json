@@ -1,9 +1,0 @@
-{
-  "provider": "gemini",
-  "model": "models/embedding-001",
-  "n_docs": 43,
-  "n_chunks": 822,
-  "dim": 768,
-  "data_dir": "data_eval",
-  "time": "2025-10-16 10:39:06"
-}
