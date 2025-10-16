@@ -9,3 +9,4 @@ __pycache__/
 *.lib
 data_eval/
 rag_index_eval
+eval_outputs/

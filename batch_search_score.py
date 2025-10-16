@@ -339,10 +339,10 @@ def make_summary(details, truth, mMax, out_dir="score_results"):
 # ========= Main =========
 def main():
     ap=argparse.ArgumentParser()
-    ap.add_argument("--data_dir",default="./data_eval")
+    ap.add_argument("--data_dir",default="./data")
     ap.add_argument("--select",default="4")
     ap.add_argument("--limit_docs",type=int,default=0)
-    ap.add_argument("--index_dir",default="./rag_index_eval")
+    ap.add_argument("--index_dir",default="./rag_index")
     ap.add_argument("--k",type=int,default=50, help="上位チャンク数（親集約前）")
     ap.add_argument("--mMax",type=int,default=10, help="親文献の上限（予測として返す最大件数）")
     ap.add_argument("--provider",choices=["gemini","openai_compat"],default="gemini")
